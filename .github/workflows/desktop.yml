@@ -93,4 +93,4 @@ jobs:
             dist/Arcane-Portal-macOS-Intel.zip \
             --repo "$GITHUB_REPOSITORY" --verify-tag \
             --title "Arcane Portal $GITHUB_REF_NAME" \
-            --notes 'Share a screen or window on your local network. Extract the ZIP for your platform. Windows runs as a portable executable. On macOS, move Arcane Portal.app to Applications. These builds are unsigned on Windows and ad-hoc signed on macOS.'
+            --notes 'Share a screen or window on your local network. Broadcasts appear automatically in Live Rooms. Select Watch to join. Extract the ZIP for your platform. Windows runs as a portable executable. On macOS, move Arcane Portal.app to Applications. These builds are unsigned on Windows and ad-hoc signed on macOS.'

@@ -1,14 +1,13 @@
 use crate::Frame;
 use crate::capture::{self, Capture, Quality, Source, SourceKind};
-use crate::network::{DEFAULT_PORT, Discovery, Host, Room, Viewer};
+use crate::network::{Discovery, Host, Room, Viewer};
 use eframe::egui::{
     self, Align, Color32, FontId, Layout, Margin, Painter, Pos2, Rect, Response, RichText, Sense,
     Shape, Stroke, StrokeKind, TextureHandle, Ui, UiBuilder, Vec2, pos2, vec2,
 };
 use serde::{Deserialize, Serialize};
-use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::{Arc, mpsc};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const BACKGROUND: Color32 = Color32::from_rgb(16, 17, 23);
 const SIDEBAR: Color32 = Color32::from_rgb(21, 22, 30);
@@ -22,7 +21,6 @@ const ACCENT_DARK: Color32 = Color32::from_rgb(39, 30, 63);
 const GREEN: Color32 = Color32::from_rgb(115, 223, 173);
 const RED: Color32 = Color32::from_rgb(255, 156, 174);
 const PREFS_KEY: &str = "arcane-portal-preferences";
-const COPY_FEEDBACK_DURATION: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -75,8 +73,7 @@ enum Session {
     },
     Watching {
         viewer: Viewer,
-        address: SocketAddrV4,
-        selected_room: Option<Room>,
+        selected_room: Room,
     },
 }
 
@@ -107,7 +104,6 @@ pub struct PortalApp {
     preferences: Preferences,
     name_draft: String,
     title_draft: String,
-    address_draft: String,
     discovery: Option<Discovery>,
     discovery_error: Option<String>,
     sources: Vec<Source>,
@@ -118,7 +114,6 @@ pub struct PortalApp {
     session: Session,
     texture: Option<(Arc<Frame>, TextureHandle)>,
     fullscreen: bool,
-    address_copied: Option<Instant>,
     notice: Option<(String, bool)>,
 }
 
@@ -136,7 +131,6 @@ impl PortalApp {
             name_draft: preferences.name.clone(),
             preferences,
             title_draft: String::new(),
-            address_draft: String::new(),
             discovery: None,
             discovery_error: None,
             sources: Vec::new(),
@@ -147,7 +141,6 @@ impl PortalApp {
             session: Session::Idle,
             texture: None,
             fullscreen: false,
-            address_copied: None,
             notice: None,
         };
         app.refresh_discovery();
@@ -272,35 +265,16 @@ impl PortalApp {
         }
     }
 
-    fn join(&mut self, address: SocketAddrV4, selected_room: Option<Room>) {
-        match Viewer::connect(address) {
+    fn join(&mut self, selected_room: Room) {
+        match Viewer::connect(selected_room.address) {
             Ok(viewer) => {
                 self.notice = None;
                 self.session = Session::Watching {
                     viewer,
-                    address,
                     selected_room,
                 };
             }
             Err(error) => self.notice = Some((error, true)),
-        }
-    }
-
-    fn join_manually(&mut self) {
-        let input = self.address_draft.trim();
-        let address = input.parse::<SocketAddrV4>().or_else(|_| {
-            input
-                .parse::<Ipv4Addr>()
-                .map(|ip| SocketAddrV4::new(ip, DEFAULT_PORT))
-        });
-        match address {
-            Ok(address) => self.join(address, None),
-            Err(_) => {
-                self.notice = Some((
-                    "Enter a local IPv4 address, with an optional port.".into(),
-                    true,
-                ));
-            }
         }
     }
 
@@ -312,7 +286,6 @@ impl PortalApp {
     fn end_session(&mut self, ctx: &egui::Context) {
         self.session = Session::Idle;
         self.texture = None;
-        self.address_copied = None;
         if self.fullscreen {
             self.set_fullscreen(ctx, false);
         }
@@ -509,13 +482,11 @@ impl PortalApp {
             if !rooms.is_empty() {
                 badge(ui, &rooms.len().to_string(), QUIET);
             }
-            if self.discovery_error.is_some() {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if button(ui, "Retry discovery", false).clicked() {
-                        self.refresh_discovery();
-                    }
-                });
-            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if button(ui, "Refresh rooms", false).clicked() {
+                    self.refresh_discovery();
+                }
+            });
         });
         ui.add_space(9.0);
         if rooms.is_empty() {
@@ -541,35 +512,14 @@ impl PortalApp {
         } else {
             for room in rooms {
                 if display_room(ui, &room, !self.session.active()) {
-                    self.join(room.address, Some(room));
+                    self.join(room);
                     break;
                 }
                 ui.add_space(7.0);
             }
         }
-        ui.add_space(22.0);
-        heading(ui, "Join by address", 17.0);
-        ui.label(RichText::new("Use the address shared by the broadcaster.").color(QUIET));
-        ui.add_space(6.0);
-        ui.add_enabled_ui(!self.session.active(), |ui| {
-            ui.horizontal(|ui| {
-                let input_width = (ui.available_width() - 84.0).clamp(110.0, 300.0);
-                let input = ui.add_sized(
-                    vec2(input_width, 35.0),
-                    egui::TextEdit::singleline(&mut self.address_draft)
-                        .hint_text(format!("192.168.1.20:{DEFAULT_PORT}"))
-                        .margin(Margin::symmetric(8, 5))
-                        .vertical_align(Align::Center)
-                        .char_limit(32),
-                );
-                let submitted =
-                    input.lost_focus() && ui.input(|state| state.key_pressed(egui::Key::Enter));
-                if button(ui, "Join room", false).clicked() || submitted {
-                    self.join_manually();
-                }
-            });
-        });
         if matches!(self.session, Session::Hosting { .. }) {
+            ui.add_space(9.0);
             ui.label(
                 RichText::new("Stop your broadcast before joining another room.")
                     .size(12.0)
@@ -820,7 +770,10 @@ impl PortalApp {
         let name = name.clone();
         let title = title.clone();
         let viewers = host.viewers();
-        let addresses = host.addresses();
+        let on_lan = host
+            .addresses()
+            .iter()
+            .any(|address| !address.ip().is_loopback());
         let is_live = self.texture.is_some();
         ui.horizontal_wrapped(|ui| {
             badge(
@@ -844,65 +797,29 @@ impl PortalApp {
         ui.add_space(12.0);
         if self.session.active() {
             self.stage(ui, "Starting screen capture…");
-        }
-        ui.add_space(12.0);
-        let primary = addresses.iter().find(|address| !address.ip().is_loopback());
-        if let Some(address) = primary {
-            card().show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Room address").strong());
-                    ui.label(RichText::new(address.to_string()).monospace().color(ACCENT));
-                    let copied = self
-                        .address_copied
-                        .is_some_and(|time| time.elapsed() < COPY_FEEDBACK_DURATION);
-                    let copy_label = if copied { "Copied" } else { "Copy address" };
-                    if button(ui, copy_label, false).clicked() {
-                        ui.ctx().copy_text(address.to_string());
-                        self.address_copied = Some(Instant::now());
-                    }
-                    if addresses
-                        .iter()
-                        .filter(|address| !address.ip().is_loopback())
-                        .count()
-                        > 1
-                    {
-                        ui.menu_button("Other addresses", |ui| {
-                            for alternative in addresses.iter().filter(|alternative| {
-                                *alternative != address && !alternative.ip().is_loopback()
-                            }) {
-                                if ui.button(alternative.to_string()).clicked() {
-                                    ui.ctx().copy_text(alternative.to_string());
-                                    self.address_copied = Some(Instant::now());
-                                    ui.close();
-                                }
-                            }
-                        });
-                    }
-                });
-            });
-        } else {
-            ui.label(
-                RichText::new(
-                    "Connect to a local network to share a room address with other devices.",
-                )
-                .color(QUIET),
-            );
+            if !on_lan {
+                ui.label(
+                    RichText::new("Connect to a local network, then restart the broadcast.")
+                        .color(QUIET),
+                );
+            } else if is_live {
+                ui.label(
+                    RichText::new("Viewers on this network can find you in Live Rooms.")
+                        .color(QUIET),
+                );
+            }
         }
     }
 
     fn watching(&mut self, ui: &mut Ui) {
         let Session::Watching {
             viewer,
-            address,
             selected_room,
         } = &self.session
         else {
             return;
         };
-        let room = viewer.room().or_else(|| selected_room.clone());
-        let address = *address;
-        let title = room.as_ref().map_or("Joining room…", |room| &room.title);
+        let room = viewer.room().unwrap_or_else(|| selected_room.clone());
         let is_live = self.texture.is_some();
         ui.horizontal_wrapped(|ui| {
             badge(
@@ -910,24 +827,20 @@ impl PortalApp {
                 if is_live { "Live" } else { "Connecting" },
                 if is_live { RED } else { ACCENT },
             );
-            heading(ui, title, 26.0);
+            heading(ui, &room.title, 26.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if button(ui, "Leave room", false).clicked() {
                     self.end_session(ui.ctx());
                 }
             });
         });
-        if let Some(room) = room {
-            ui.label(
-                RichText::new(format!(
-                    "{}  ·  {}p at {} fps",
-                    room.name, room.height, room.fps
-                ))
-                .color(QUIET),
-            );
-        } else {
-            ui.label(RichText::new(address.to_string()).color(QUIET));
-        }
+        ui.label(
+            RichText::new(format!(
+                "{}  ·  {}p at {} fps",
+                room.name, room.height, room.fps
+            ))
+            .color(QUIET),
+        );
         ui.add_space(12.0);
         if self.session.active() {
             self.stage(ui, "Waiting for the first frame…");

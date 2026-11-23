@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Frame;
 
-pub const DEFAULT_PORT: u16 = 48742;
+const DEFAULT_PORT: u16 = 48742;
 const SERVICE_TYPE: &str = "_arcane-portal._tcp.local.";
 const VERSION: &str = "1";
 const MAGIC: [u8; 8] = *b"APLAN01\n";
@@ -598,7 +598,7 @@ impl Viewer {
                     .iter()
                     .any(|interface| same_lan(interface, *address.ip())))
         {
-            return Err("Use a valid IPv4 address and port on your local network.".into());
+            return Err("This room is no longer reachable on your local network.".into());
         }
         let state = Arc::new(Mutex::new(ViewerState::default()));
         let worker = Arc::clone(&state);
