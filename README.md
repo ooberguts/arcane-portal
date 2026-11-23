@@ -34,7 +34,7 @@ Rooms are open to Arcane Portal clients on a directly connected private IPv4 sub
 
 ## Build from source
 
-Install stable Rust. Use Visual Studio Build Tools with the Desktop development with C++ workload on Windows, or Xcode with a macOS 13 or newer SDK on macOS.
+Install stable Rust. Use Visual Studio Build Tools with the Desktop development with C++ workload on Windows, or Xcode 26 or newer on macOS. The Mac packages target macOS 13 and later.
 
 ```sh
 cargo test --locked

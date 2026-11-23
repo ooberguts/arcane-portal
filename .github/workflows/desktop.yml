@@ -26,11 +26,11 @@ jobs:
             target: x86_64-pc-windows-msvc
             package: Arcane-Portal-Windows-x64
           - name: macOS Apple silicon
-            runner: macos-15
+            runner: macos-26
             target: aarch64-apple-darwin
             package: Arcane-Portal-macOS-Apple-silicon
           - name: macOS Intel
-            runner: macos-15-intel
+            runner: macos-26-intel
             target: x86_64-apple-darwin
             package: Arcane-Portal-macOS-Intel
     steps:
@@ -42,6 +42,11 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt --target '${{ matrix.target }}'
           rustup default stable
+      - name: Report macOS compiler and SDK
+        if: runner.os == 'macOS'
+        run: |
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
       - name: Check formatting and run tests
         shell: bash
         run: |
