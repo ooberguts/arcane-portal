@@ -4,9 +4,11 @@
 )]
 
 mod app;
+mod audio;
 mod capture;
 mod install;
 mod network;
+mod reverse;
 mod update;
 
 pub(crate) struct Frame {

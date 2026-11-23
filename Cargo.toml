@@ -1,6 +1,6 @@
 [package]
 name = "arcane-portal"
-version = "0.2.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.93"
 description = "Share or watch a screen on your local network."
@@ -9,16 +9,25 @@ publish = false
 
 [dependencies]
 eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "glow", "persistence", "x11"] }
+fast_image_resize = { version = "5.5.0", features = ["image"] }
+getrandom = "0.4.3"
 if-addrs = "0.15.0"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+jpeg-encoder = { version = "0.6.1", features = ["simd"] }
 mdns-sd = "0.21.6"
 semver = "1.0.28"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10.9"
+socket2 = "0.6.5"
 tempfile = "3.27.0"
 ureq = { version = "3.5.2", default-features = false, features = ["rustls"] }
 zip = { version = "=9.5.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zune-core = "0.5.3"
+zune-jpeg = "0.5.15"
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+cpal = "0.15.3"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-capture = "2.0.1"

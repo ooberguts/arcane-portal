@@ -27,6 +27,7 @@
   <key>NSBonjourServices</key>
   <array>
     <string>_arcane-portal._tcp</string>
+    <string>_arcane-join._tcp</string>
   </array>
 </dict>
 </plist>

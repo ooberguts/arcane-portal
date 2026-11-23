@@ -1,5 +1,5 @@
 use crate::Frame;
-use crate::capture::{self, Capture, Quality, Source, SourceKind};
+use crate::capture::{self, Capture, FrameRate, Resolution, Source, SourceKind, VideoSettings};
 use crate::network::{Discovery, Host, Room, Viewer};
 use crate::update::{CURRENT_VERSION, RELEASES_URL, UpdateStatus, Updater};
 use eframe::egui::{
@@ -49,17 +49,48 @@ impl Page {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(default)]
+#[serde(from = "StoredPreferences")]
 struct Preferences {
     name: String,
-    quality: u8,
+    video: VideoSettings,
 }
 
 impl Default for Preferences {
     fn default() -> Self {
         Self {
             name: default_name(),
-            quality: 1,
+            video: VideoSettings::default(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct StoredPreferences {
+    name: Option<String>,
+    video: Option<VideoSettings>,
+    quality: Option<u8>,
+}
+
+impl From<StoredPreferences> for Preferences {
+    fn from(stored: StoredPreferences) -> Self {
+        let video = stored.video.unwrap_or_else(|| match stored.quality {
+            Some(0) => VideoSettings {
+                resolution: Resolution::P480,
+                frame_rate: FrameRate::Fps15,
+            },
+            Some(1) => VideoSettings {
+                resolution: Resolution::P720,
+                frame_rate: FrameRate::Fps24,
+            },
+            Some(2) => VideoSettings {
+                resolution: Resolution::P1080,
+                frame_rate: FrameRate::Fps30,
+            },
+            _ => VideoSettings::default(),
+        });
+        Self {
+            name: stored.name.unwrap_or_else(default_name),
+            video,
         }
     }
 }
@@ -90,14 +121,6 @@ impl Session {
             Self::Idle => None,
         }
     }
-
-    fn error(&self) -> Option<String> {
-        match self {
-            Self::Hosting { capture, .. } => capture.error(),
-            Self::Watching { viewer, .. } => viewer.error(),
-            Self::Idle => None,
-        }
-    }
 }
 
 pub struct PortalApp {
@@ -115,6 +138,13 @@ pub struct PortalApp {
     session: Session,
     texture: Option<(Arc<Frame>, TextureHandle)>,
     fullscreen: bool,
+    share_audio: bool,
+    audio_capture: Option<crate::audio::AudioCapture>,
+    audio_capture_start: Option<mpsc::Receiver<Result<crate::audio::AudioCapture, String>>>,
+    audio_capture_enabled: Option<Arc<std::sync::atomic::AtomicBool>>,
+    play_audio: bool,
+    audio_output: Option<crate::audio::AudioOutput>,
+    audio_output_start: Option<mpsc::Receiver<Result<crate::audio::AudioOutput, String>>>,
     notice: Option<(String, bool)>,
     updater: Updater,
 }
@@ -150,6 +180,13 @@ impl PortalApp {
             session: Session::Idle,
             texture: None,
             fullscreen: false,
+            share_audio: false,
+            audio_capture: None,
+            audio_capture_start: None,
+            audio_capture_enabled: None,
+            play_audio: true,
+            audio_output: None,
+            audio_output_start: None,
             notice: None,
             updater,
         };
@@ -179,14 +216,6 @@ impl PortalApp {
             && self.source_request.is_none()
         {
             self.refresh_sources(ctx);
-        }
-    }
-
-    fn quality(&self) -> Quality {
-        match self.preferences.quality {
-            0 => Quality::Low,
-            2 => Quality::High,
-            _ => Quality::Standard,
         }
     }
 
@@ -251,15 +280,10 @@ impl PortalApp {
             "" => "Screen share".to_owned(),
             title => title.to_owned(),
         };
-        let quality = self.quality();
-        let started = Host::start(
-            &self.preferences.name,
-            &title,
-            quality.height(),
-            quality.fps(),
-        )
-        .and_then(|host| {
-            Capture::start(source, quality, host.publisher()).map(|capture| (host, capture))
+        let settings = self.preferences.video;
+        let (height, fps) = settings.initial_format();
+        let started = Host::start(&self.preferences.name, &title, height, fps).and_then(|host| {
+            Capture::start(source, settings, host.publisher()).map(|capture| (host, capture))
         });
         match started {
             Ok((host, capture)) => {
@@ -270,15 +294,83 @@ impl PortalApp {
                     name: self.preferences.name.clone(),
                     title,
                 };
+                self.update_audio_capture();
             }
             Err(error) => self.notice = Some((error, true)),
         }
     }
 
+    fn update_audio_capture(&mut self) {
+        if !self.share_audio {
+            if let Some(enabled) = self.audio_capture_enabled.take() {
+                enabled.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.audio_capture_start = None;
+            self.audio_capture = None;
+            if let Session::Hosting { host, .. } = &self.session {
+                host.clear_audio();
+            }
+        } else if self.audio_capture.is_none()
+            && self.audio_capture_start.is_none()
+            && let Session::Hosting { host, .. } = &self.session
+        {
+            let publish = host.audio_publisher();
+            let enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            self.audio_capture_enabled = Some(enabled.clone());
+            let publish = move |packet| {
+                if enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                    publish(packet);
+                }
+            };
+            let (send, receive) = mpsc::channel();
+            match std::thread::Builder::new()
+                .name("portal-audio-capture-start".into())
+                .spawn(move || {
+                    let _ = send.send(crate::audio::AudioCapture::start(publish));
+                }) {
+                Ok(_) => self.audio_capture_start = Some(receive),
+                Err(error) => {
+                    self.share_audio = false;
+                    self.notice = Some((format!("Could not share system audio: {error}"), true));
+                }
+            }
+        }
+    }
+
+    fn start_audio_output(&mut self) {
+        if !self.play_audio || self.audio_output.is_some() || self.audio_output_start.is_some() {
+            return;
+        }
+        let (send, receive) = mpsc::channel();
+        match std::thread::Builder::new()
+            .name("portal-audio-output-start".into())
+            .spawn(move || {
+                let _ = send.send(crate::audio::AudioOutput::start());
+            }) {
+            Ok(_) => self.audio_output_start = Some(receive),
+            Err(error) => {
+                self.play_audio = false;
+                self.notice = Some((format!("Could not play audio: {error}"), true));
+            }
+        }
+    }
+
+    fn audio_controls(&mut self, ui: &mut Ui) {
+        if ui
+            .checkbox(&mut self.share_audio, "Share system audio")
+            .changed()
+        {
+            self.update_audio_capture();
+        }
+    }
+
     fn join(&mut self, selected_room: Room) {
-        match Viewer::connect(selected_room.address) {
+        match Viewer::join(&selected_room) {
             Ok(viewer) => {
                 self.notice = None;
+                self.texture = None;
+                self.audio_output_start = None;
+                self.audio_output = None;
                 self.session = Session::Watching {
                     viewer,
                     selected_room,
@@ -289,11 +381,23 @@ impl PortalApp {
     }
 
     fn set_fullscreen(&mut self, ctx: &egui::Context, fullscreen: bool) {
+        let fullscreen = fullscreen && matches!(self.session, Session::Watching { .. });
         self.fullscreen = fullscreen;
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(fullscreen));
     }
 
     fn end_session(&mut self, ctx: &egui::Context) {
+        if let Some(enabled) = self.audio_capture_enabled.take() {
+            enabled.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.audio_capture_start = None;
+        self.audio_capture = None;
+        if let Session::Hosting { host, .. } = &self.session {
+            host.clear_audio();
+        }
+        self.audio_output_start = None;
+        self.audio_output = None;
+        self.share_audio = false;
         self.session = Session::Idle;
         self.texture = None;
         if self.fullscreen {
@@ -302,17 +406,87 @@ impl PortalApp {
     }
 
     fn update_session(&mut self, ctx: &egui::Context) {
-        if let Some(error) = self.session.error() {
-            let return_to = match self.session {
-                Session::Hosting { .. } => Page::Broadcast,
-                _ => Page::Rooms,
-            };
-            self.end_session(ctx);
-            self.navigate(return_to, ctx);
-            self.notice = Some((error, true));
-            return;
+        if let Some(result) = self
+            .audio_capture_start
+            .as_ref()
+            .and_then(|rx| match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("Audio capture worker stopped.".into()))
+                }
+                Err(mpsc::TryRecvError::Empty) => None,
+            })
+        {
+            self.audio_capture_start = None;
+            match result {
+                Ok(capture) => self.audio_capture = Some(capture),
+                Err(error) => {
+                    self.share_audio = false;
+                    self.notice = Some((format!("Could not share system audio: {error}"), true));
+                }
+            }
         }
-        if self.fullscreen && ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+        if let Some(result) = self
+            .audio_output_start
+            .as_ref()
+            .and_then(|rx| match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("Audio playback worker stopped.".into()))
+                }
+                Err(mpsc::TryRecvError::Empty) => None,
+            })
+        {
+            self.audio_output_start = None;
+            match result {
+                Ok(output) => self.audio_output = Some(output),
+                Err(error) => {
+                    self.play_audio = false;
+                    self.notice = Some((format!("Could not play audio: {error}"), true));
+                }
+            }
+        }
+        if let Some(error) = self
+            .audio_capture
+            .as_ref()
+            .and_then(|capture| capture.error())
+        {
+            self.share_audio = false;
+            self.update_audio_capture();
+            self.notice = Some((format!("System audio stopped: {error}"), true));
+        }
+        if let Some(error) = self.audio_output.as_ref().and_then(|output| output.error()) {
+            self.audio_output = None;
+            self.play_audio = false;
+            self.notice = Some((format!("Audio playback stopped: {error}"), true));
+        }
+        let packets = match &self.session {
+            Session::Watching { viewer, .. } => viewer.take_audio_packets(),
+            _ => Vec::new(),
+        };
+        if !packets.is_empty() {
+            self.start_audio_output();
+            if let Some(output) = &self.audio_output {
+                for packet in packets {
+                    output.push(&packet);
+                }
+            }
+        }
+        if let Session::Hosting { host, capture, .. } = &self.session {
+            if let Some(error) = capture.error() {
+                self.end_session(ctx);
+                self.navigate(Page::Broadcast, ctx);
+                self.notice = Some((error, true));
+                return;
+            }
+            let (height, fps) = capture.format();
+            host.set_format(height, fps);
+            capture.set_network_fps_limit(host.network_fps_limit());
+        }
+        if self.fullscreen
+            && (ctx.input(|input| input.key_pressed(egui::Key::Escape))
+                || matches!(&self.session, Session::Watching { viewer, .. } if viewer.error().is_some()))
+        {
             self.set_fullscreen(ctx, false);
         }
         if let Some(frame) = self.session.frame() {
@@ -454,7 +628,7 @@ impl PortalApp {
                         let (label, color) = if self.discovery.is_some() {
                             ("LAN discovery active", GREEN)
                         } else {
-                            ("Manual connections", QUIET)
+                            ("LAN discovery unavailable", QUIET)
                         };
                         badge(ui, label, color);
                     });
@@ -653,17 +827,9 @@ impl PortalApp {
                     .char_limit(120),
             );
             ui.add_space(9.0);
-            ui.label(RichText::new("Video quality").strong());
-            ui.horizontal_wrapped(|ui| {
-                for (index, quality) in [Quality::Low, Quality::Standard, Quality::High]
-                    .into_iter()
-                    .enumerate()
-                {
-                    if button(ui, quality.label(), self.quality() == quality).clicked() {
-                        self.preferences.quality = index as u8;
-                    }
-                }
-            });
+            self.video_controls(ui);
+            ui.add_space(8.0);
+            self.audio_controls(ui);
         });
         ui.add_space(14.0);
         let can_start = self.selected_source.is_some()
@@ -683,6 +849,55 @@ impl PortalApp {
                     .color(QUIET),
             );
         });
+    }
+
+    fn video_controls(&mut self, ui: &mut Ui) {
+        let settings = &mut self.preferences.video;
+        let previous = *settings;
+        ui.horizontal_wrapped(|ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new("Resolution").strong())
+                    .on_hover_text("Auto adjusts the output size to keep the stream moving.");
+                egui::ComboBox::from_id_salt("broadcast-resolution")
+                    .width(130.0)
+                    .selected_text(settings.resolution.label())
+                    .show_ui(ui, |ui| {
+                        for option in [
+                            Resolution::Auto,
+                            Resolution::P480,
+                            Resolution::P720,
+                            Resolution::P1080,
+                        ] {
+                            ui.selectable_value(&mut settings.resolution, option, option.label());
+                        }
+                    });
+            });
+            ui.vertical(|ui| {
+                ui.label(RichText::new("Frame rate").strong())
+                    .on_hover_text(
+                        "Auto adjusts the frame rate to capture and viewer performance.",
+                    );
+                egui::ComboBox::from_id_salt("broadcast-frame-rate")
+                    .width(130.0)
+                    .selected_text(settings.frame_rate.label())
+                    .show_ui(ui, |ui| {
+                        for option in [
+                            FrameRate::Auto,
+                            FrameRate::Fps15,
+                            FrameRate::Fps24,
+                            FrameRate::Fps30,
+                            FrameRate::Fps60,
+                        ] {
+                            ui.selectable_value(&mut settings.frame_rate, option, option.label());
+                        }
+                    });
+            });
+        });
+        if *settings != previous
+            && let Session::Hosting { capture, .. } = &self.session
+        {
+            capture.set_settings(*settings);
+        }
     }
 
     fn source_picker(&mut self, ui: &mut Ui) {
@@ -878,7 +1093,10 @@ impl PortalApp {
 
     fn hosting(&mut self, ui: &mut Ui) {
         let Session::Hosting {
-            host, name, title, ..
+            host,
+            capture,
+            name,
+            title,
         } = &self.session
         else {
             return;
@@ -886,6 +1104,8 @@ impl PortalApp {
         let name = name.clone();
         let title = title.clone();
         let viewers = host.viewers();
+        let (_, fps) = capture.format();
+        let actual_fps = host.stream_fps();
         let on_lan = host
             .addresses()
             .iter()
@@ -912,6 +1132,28 @@ impl PortalApp {
         ui.label(RichText::new(format!("{name}  ·  {caption}")).color(QUIET));
         ui.add_space(12.0);
         if self.session.active() {
+            card().show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                self.video_controls(ui);
+                ui.add_space(8.0);
+                self.audio_controls(ui);
+                ui.label(
+                    RichText::new(format!("Published: {actual_fps:.1} fps"))
+                        .strong()
+                        .color(ACCENT),
+                );
+                if let Some((frame, _)) = self.texture.as_ref() {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} × {}  ·  Up to {fps} fps",
+                            frame.width, frame.height
+                        ))
+                        .size(12.0)
+                        .color(QUIET),
+                    );
+                }
+            });
+            ui.add_space(12.0);
             self.stage(ui, "Starting screen capture…");
             if !on_lan {
                 ui.label(
@@ -935,14 +1177,25 @@ impl PortalApp {
         else {
             return;
         };
-        let room = viewer.room().unwrap_or_else(|| selected_room.clone());
-        let is_live = self.texture.is_some();
+        let actual_fps = viewer.stream_fps();
+        let connected_room = viewer.room();
+        let error = viewer.error();
+        let audio_error = viewer.audio_error();
+        let connected = connected_room.is_some();
+        let is_live = error.is_none() && self.texture.is_some();
+        let room = connected_room.unwrap_or_else(|| selected_room.clone());
+        let failure = error.map(|error| (error, selected_room.clone()));
+        let (status, color) = if failure.is_some() {
+            ("Unavailable", RED)
+        } else if is_live {
+            ("Live", RED)
+        } else if connected {
+            ("Awaiting video", ACCENT)
+        } else {
+            ("Connecting", ACCENT)
+        };
         ui.horizontal_wrapped(|ui| {
-            badge(
-                ui,
-                if is_live { "Live" } else { "Connecting" },
-                if is_live { RED } else { ACCENT },
-            );
+            badge(ui, status, color);
             heading(ui, &room.title, 26.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if button(ui, "Leave room", false).clicked() {
@@ -950,16 +1203,50 @@ impl PortalApp {
                 }
             });
         });
+        let info = match self.texture.as_ref() {
+            Some((frame, _)) if is_live => {
+                format!("{}  ·  {} × {}", room.name, frame.width, frame.height)
+            }
+            _ => room.name,
+        };
+        ui.label(RichText::new(info).color(QUIET));
+        if ui
+            .checkbox(&mut self.play_audio, "Play stream audio")
+            .changed()
+            && !self.play_audio
+        {
+            self.audio_output_start = None;
+            self.audio_output = None;
+        }
+        if self.play_audio
+            && let Some(message) = audio_error
+        {
+            ui.label(RichText::new(message).color(QUIET));
+        }
         ui.label(
-            RichText::new(format!(
-                "{}  ·  {}p at {} fps",
-                room.name, room.height, room.fps
-            ))
-            .color(QUIET),
+            RichText::new(format!("Received: {actual_fps:.1} fps"))
+                .strong()
+                .color(ACCENT),
         );
         ui.add_space(12.0);
         if self.session.active() {
-            self.stage(ui, "Waiting for the first frame…");
+            if let Some((error, retry_room)) = failure {
+                card().show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.label(RichText::new(error).color(RED));
+                    ui.add_space(5.0);
+                    if button(ui, "Try again", true).clicked() {
+                        self.join(retry_room);
+                    }
+                });
+            } else {
+                let waiting = if connected {
+                    "Waiting for the first frame…"
+                } else {
+                    "Connecting to the broadcaster…"
+                };
+                self.stage(ui, waiting);
+            }
         }
     }
 
@@ -977,7 +1264,7 @@ impl PortalApp {
         );
         ui.painter()
             .rect_stroke(rect, 12, Stroke::new(1.0_f32, BORDER), StrokeKind::Inside);
-        if self.texture.is_some() {
+        if self.texture.is_some() && matches!(self.session, Session::Watching { .. }) {
             let full_button = ui
                 .with_layout(Layout::right_to_left(Align::Center), |ui| {
                     button(ui, "Full screen", false)
@@ -1002,6 +1289,22 @@ impl PortalApp {
                     self.texture.as_ref(),
                     "Waiting for the first frame…",
                 );
+                if let Session::Watching { viewer, .. } = &self.session {
+                    let label = format!("Received: {:.1} fps", viewer.stream_fps());
+                    let position = rect.left_top() + vec2(18.0, 18.0);
+                    ui.painter().rect_filled(
+                        Rect::from_min_size(position - vec2(8.0, 5.0), vec2(185.0, 32.0)),
+                        6,
+                        Color32::from_black_alpha(190),
+                    );
+                    ui.painter().text(
+                        position,
+                        egui::Align2::LEFT_TOP,
+                        label,
+                        FontId::proportional(18.0),
+                        Color32::WHITE,
+                    );
+                }
                 let controls = Rect::from_min_max(
                     pos2(rect.right() - 170.0, rect.top() + 14.0),
                     rect.right_top() + vec2(-14.0, 52.0),
@@ -1496,4 +1799,39 @@ fn portal_art(painter: &Painter, rect: Rect) {
         }
     }
     painter.rect_stroke(rect, 13, Stroke::new(1.0_f32, BORDER), StrokeKind::Inside);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_saved_quality_presets_to_independent_settings() {
+        for (quality, resolution, frame_rate) in [
+            (0, Resolution::P480, FrameRate::Fps15),
+            (1, Resolution::P720, FrameRate::Fps24),
+            (2, Resolution::P1080, FrameRate::Fps30),
+        ] {
+            let preferences: Preferences = serde_json::from_value(serde_json::json!({
+                "name": "Broadcaster",
+                "quality": quality,
+            }))
+            .unwrap();
+            assert_eq!(preferences.name, "Broadcaster");
+            assert_eq!(preferences.video.resolution, resolution);
+            assert_eq!(preferences.video.frame_rate, frame_rate);
+        }
+    }
+
+    #[test]
+    fn defaults_to_auto_and_keeps_explicit_video_choices() {
+        let mut preferences: Preferences = serde_json::from_str("{}").unwrap();
+        assert_eq!(preferences.video.resolution, Resolution::Auto);
+        assert_eq!(preferences.video.frame_rate, FrameRate::Auto);
+
+        preferences.video.frame_rate = FrameRate::Fps60;
+        let saved = serde_json::to_string(&preferences).unwrap();
+        let restored: Preferences = serde_json::from_str(&saved).unwrap();
+        assert_eq!(restored.video, preferences.video);
+    }
 }

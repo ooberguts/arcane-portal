@@ -1,5 +1,6 @@
-use std::collections::HashMap;
-use std::io::{self, Cursor, Read, Write};
+use std::cmp::Reverse;
+use std::collections::{HashMap, VecDeque};
+use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket,
 };
@@ -8,22 +9,33 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use if_addrs::{IfAddr, Ifv4Addr, Interface};
-use image::{DynamicImage, ImageDecoder, codecs::jpeg::JpegDecoder};
-use mdns_sd::{IfKind, IfPredicate, ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{
+    IfKind, IfPredicate, ResolvedService, ScopedIp, ServiceDaemon, ServiceEvent, ServiceInfo,
+};
 use serde::{Deserialize, Serialize};
+use zune_core::{bytestream::ZCursor, colorspace::ColorSpace, options::DecoderOptions};
+use zune_jpeg::JpegDecoder;
 
 use crate::Frame;
+use crate::audio::PACKET_BYTES;
 
 const DEFAULT_PORT: u16 = 48742;
 const SERVICE_TYPE: &str = "_arcane-portal._tcp.local.";
 const VERSION: &str = "1";
 const MAGIC: [u8; 8] = *b"APLAN01\n";
+const FAST_MAGIC: [u8; 8] = *b"APLAN02\n";
+const AUDIO_MAGIC: [u8; 8] = *b"APAUD01\n";
 const FRAME_REQUEST: [u8; 1] = [1];
+const VIDEO_CREDITS: usize = 2;
+const AUDIO_BUFFER: usize = 6;
+const AUDIO_FRESHNESS: Duration = Duration::from_millis(200);
+const FPS_WINDOW: Duration = Duration::from_secs(1);
 const MAX_TEXT_BYTES: usize = 120;
 const MAX_METADATA_BYTES: usize = 2_048;
 const MAX_JPEG_BYTES: usize = 8 * 1024 * 1024;
 const MAX_VIEWERS: usize = 8;
 const MAX_ROOMS: usize = 128;
+const MAX_ROOM_ADDRESSES: usize = 8;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(7);
 const IO_TIMEOUT: Duration = Duration::from_secs(8);
@@ -33,6 +45,9 @@ const ADVERTISE_INTERVAL: Duration = Duration::from_secs(1);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Room {
     pub address: SocketAddrV4,
+    alternatives: Vec<SocketAddrV4>,
+    service_id: Option<String>,
+    fast_video: bool,
     pub name: String,
     pub title: String,
     pub height: u32,
@@ -75,6 +90,9 @@ impl RoomDetails {
     fn into_room(self, address: SocketAddrV4, viewers: usize) -> Room {
         Room {
             address,
+            alternatives: Vec::new(),
+            service_id: None,
+            fast_video: false,
             name: self.name,
             title: self.title,
             height: self.height,
@@ -108,7 +126,7 @@ impl Discovery {
                     match event {
                         ServiceEvent::ServiceResolved(service) => {
                             let key = service.get_fullname().to_owned();
-                            let room = discovered_room(&service, &lan_interfaces());
+                            let room = discovered_room(&service, &active_lan_interfaces());
                             let mut rooms = room_list.lock().unwrap();
                             if let Some(room) = room {
                                 if rooms.contains_key(&key) || rooms.len() < MAX_ROOMS {
@@ -146,15 +164,45 @@ impl Drop for Discovery {
     }
 }
 
-fn discovered_room(service: &ResolvedService, interfaces: &[Ifv4Addr]) -> Option<Room> {
+fn discovered_room(service: &ResolvedService, interfaces: &[Interface]) -> Option<Room> {
     if service.get_property_val_str("v")? != VERSION || service.get_port() == 0 {
         return None;
     }
-    let address = service
-        .get_addresses_v4()
-        .into_iter()
-        .filter(|ip| interfaces.iter().any(|interface| same_lan(interface, *ip)))
-        .min_by_key(|ip| (ip.is_link_local(), *ip))?;
+    let mut addresses: Vec<_> = service
+        .get_addresses()
+        .iter()
+        .filter_map(|scoped| {
+            let ScopedIp::V4(scoped) = scoped else {
+                return None;
+            };
+            let ip = *scoped.addr();
+            let route = interfaces
+                .iter()
+                .filter_map(|interface| {
+                    let address = lan_address(interface)?;
+                    if !same_lan(address, ip) {
+                        return None;
+                    }
+                    let received_here = scoped.interface_ids().iter().any(|source| {
+                        interface.index == Some(source.index) || interface.name == source.name
+                    });
+                    Some((received_here, address.prefixlen))
+                })
+                .max()?;
+            Some((ip.is_link_local(), Reverse(route), ip))
+        })
+        .collect();
+    addresses.sort_unstable();
+    let mut endpoints = Vec::new();
+    for (_, _, ip) in addresses {
+        let endpoint = SocketAddrV4::new(ip, service.get_port());
+        if !endpoints.contains(&endpoint) {
+            endpoints.push(endpoint);
+        }
+        if endpoints.len() == MAX_ROOM_ADDRESSES {
+            break;
+        }
+    }
     let details = RoomDetails::new(
         service.get_property_val_str("name")?,
         service.get_property_val_str("title")?,
@@ -165,10 +213,12 @@ fn discovered_room(service: &ResolvedService, interfaces: &[Ifv4Addr]) -> Option
         .get_property_val_str("viewers")?
         .parse::<usize>()
         .ok()?;
-    Some(details.into_room(
-        SocketAddrV4::new(address, service.get_port()),
-        viewers.min(MAX_VIEWERS),
-    ))
+    let mut endpoints = endpoints.into_iter();
+    let mut room = details.into_room(endpoints.next()?, viewers.min(MAX_VIEWERS));
+    room.alternatives = endpoints.collect();
+    room.service_id = Some(service.get_fullname().to_owned());
+    room.fast_video = service.get_property_val_str("video") == Some("2");
+    Some(room)
 }
 
 fn start_mdns() -> Result<ServiceDaemon, mdns_sd::Error> {
@@ -182,9 +232,16 @@ fn start_mdns() -> Result<ServiceDaemon, mdns_sd::Error> {
     Ok(daemon)
 }
 
-fn lan_interfaces() -> Vec<Ifv4Addr> {
+fn active_lan_interfaces() -> Vec<Interface> {
     if_addrs::get_if_addrs()
         .unwrap_or_default()
+        .into_iter()
+        .filter(|interface| lan_address(interface).is_some())
+        .collect()
+}
+
+fn lan_interfaces() -> Vec<Ifv4Addr> {
+    active_lan_interfaces()
         .iter()
         .filter_map(lan_address)
         .cloned()
@@ -209,7 +266,7 @@ fn private_address(ip: Ipv4Addr) -> bool {
     ip.is_private() || ip.is_link_local()
 }
 
-fn same_lan(address: &Ifv4Addr, peer: Ipv4Addr) -> bool {
+pub(crate) fn same_lan(address: &Ifv4Addr, peer: Ipv4Addr) -> bool {
     let mask = u32::from(address.netmask);
     private_address(peer)
         && address.broadcast != Some(peer)
@@ -257,12 +314,27 @@ impl Host {
             )
         });
 
-        let state = Arc::new(HostState::default());
+        let state = Arc::new(HostState {
+            data: Mutex::new(HostData {
+                details,
+                stopped: false,
+                latest: None,
+                clients: HashMap::new(),
+                next_client: 0,
+                viewers: 0,
+                fps: FrameRate::default(),
+                audio: VecDeque::new(),
+                audio_sequence: 0,
+                audio_generation: 0,
+            }),
+            ready: Condvar::new(),
+            audio_ready: Condvar::new(),
+        });
         let host = Arc::clone(&state);
         let lan_addresses = addresses.clone();
         let listener = thread::Builder::new()
             .name("arcane-host".into())
-            .spawn(move || run_host(&host, &listeners, details, lan_addresses))?;
+            .spawn(move || run_host(&host, &listeners, lan_addresses))?;
         if addresses.is_empty() {
             addresses.push(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
         }
@@ -284,6 +356,7 @@ impl Host {
             if !data.stopped {
                 let sequence = data.latest.as_ref().map_or(1, |(sequence, _)| sequence + 1);
                 data.latest = Some((sequence, jpeg));
+                data.fps.record();
                 state.ready.notify_all();
             }
         }
@@ -291,6 +364,69 @@ impl Host {
 
     pub fn viewers(&self) -> usize {
         self.state.data.lock().unwrap().viewers
+    }
+
+    pub fn stream_fps(&self) -> f32 {
+        self.state.data.lock().unwrap().fps.get()
+    }
+
+    pub fn audio_publisher(&self) -> impl Fn(Arc<[u8]>) + Send + 'static + use<> {
+        let state = Arc::clone(&self.state);
+        let generation = {
+            let mut data = state.data.lock().unwrap();
+            data.audio_generation = data.audio_generation.wrapping_add(1);
+            data.audio.clear();
+            data.audio_generation
+        };
+        move |samples| {
+            if samples.len() != PACKET_BYTES {
+                return;
+            }
+            let mut data = state.data.lock().unwrap();
+            if !data.stopped && data.audio_generation == generation {
+                data.audio_sequence += 1;
+                let sequence = data.audio_sequence;
+                if data.audio.len() == AUDIO_BUFFER {
+                    data.audio.pop_front();
+                }
+                data.audio.push_back(AudioPacket {
+                    sequence,
+                    samples,
+                    captured: Instant::now(),
+                });
+                state.audio_ready.notify_all();
+            }
+        }
+    }
+
+    pub fn clear_audio(&self) {
+        let mut data = self.state.data.lock().unwrap();
+        data.audio_generation = data.audio_generation.wrapping_add(1);
+        data.audio.clear();
+    }
+
+    pub fn set_format(&self, height: u32, fps: u32) {
+        if (1..=1080).contains(&height) && (1..=60).contains(&fps) {
+            let mut data = self.state.data.lock().unwrap();
+            data.details.height = height;
+            data.details.fps = fps;
+        }
+    }
+
+    pub fn network_fps_limit(&self) -> Option<u32> {
+        self.state
+            .data
+            .lock()
+            .unwrap()
+            .clients
+            .values()
+            .filter_map(|connection| {
+                let delivery = connection.delivery.as_ref()?;
+                (delivery.samples >= 3 && delivery.updated.elapsed() <= IO_TIMEOUT)
+                    .then_some(delivery.average / u32::from(delivery.credits))
+            })
+            .max()
+            .map(|delay| (1.0 / delay.as_secs_f64()).floor().clamp(1.0, 240.0) as u32)
     }
 
     pub fn addresses(&self) -> Vec<SocketAddrV4> {
@@ -303,10 +439,11 @@ impl Drop for Host {
         {
             let mut data = self.state.data.lock().unwrap();
             data.stopped = true;
-            for socket in data.clients.values() {
-                let _ = socket.shutdown(Shutdown::Both);
+            for connection in data.clients.values() {
+                let _ = connection.socket.shutdown(Shutdown::Both);
             }
             self.state.ready.notify_all();
+            self.state.audio_ready.notify_all();
         }
         if let Some(listener) = self.listener.take() {
             listener.thread().unpark();
@@ -336,51 +473,131 @@ fn bind_loopback(port: u16) -> io::Result<TcpListener> {
     Ok(listener)
 }
 
-#[derive(Default)]
 struct HostState {
     data: Mutex<HostData>,
     ready: Condvar,
+    audio_ready: Condvar,
+}
+
+struct HostData {
+    details: RoomDetails,
+    stopped: bool,
+    latest: Option<(u64, Arc<[u8]>)>,
+    clients: HashMap<u64, Connection>,
+    next_client: u64,
+    viewers: usize,
+    fps: FrameRate,
+    audio: VecDeque<AudioPacket>,
+    audio_sequence: u64,
+    audio_generation: u64,
 }
 
 #[derive(Default)]
-struct HostData {
-    stopped: bool,
-    latest: Option<(u64, Arc<[u8]>)>,
-    clients: HashMap<u64, TcpStream>,
-    next_client: u64,
-    viewers: usize,
+struct FrameRate(VecDeque<Instant>);
+
+impl FrameRate {
+    fn record(&mut self) {
+        let now = Instant::now();
+        while self
+            .0
+            .front()
+            .is_some_and(|time| now.duration_since(*time) >= FPS_WINDOW)
+        {
+            self.0.pop_front();
+        }
+        if self.0.len() == 120 {
+            self.0.pop_front();
+        }
+        self.0.push_back(now);
+    }
+
+    fn get(&self) -> f32 {
+        self.0
+            .iter()
+            .rev()
+            .take_while(|time| time.elapsed() < FPS_WINDOW)
+            .count() as f32
+    }
+}
+
+struct AudioPacket {
+    sequence: u64,
+    samples: Arc<[u8]>,
+    captured: Instant,
+}
+
+struct Connection {
+    socket: TcpStream,
+    delivery: Option<Delivery>,
+    channel: Option<Channel>,
+}
+
+struct Delivery {
+    average: Duration,
+    samples: u8,
+    updated: Instant,
+    credits: u8,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Channel {
+    Video,
+    Audio,
 }
 
 fn run_host(
     state: &Arc<HostState>,
     listeners: &[(TcpListener, Option<Ifv4Addr>)],
-    details: RoomDetails,
     addresses: Vec<SocketAddrV4>,
 ) {
     let mut advertisement = None;
     let mut checked_at = None::<Instant>;
-    let mut announced_viewers = None;
+    let mut announced = None;
     loop {
-        let (stopped, has_frame, viewers) = {
+        let (stopped, has_frame, announcement) = {
             let data = state.data.lock().unwrap();
-            (data.stopped, data.latest.is_some(), data.viewers)
+            (
+                data.stopped,
+                data.latest.is_some(),
+                (data.viewers, data.details.height, data.details.fps),
+            )
         };
         if stopped {
             break;
         }
         if !addresses.is_empty()
             && has_frame
-            && announced_viewers != Some(viewers)
+            && announced != Some(announcement)
             && checked_at.is_none_or(|time| time.elapsed() >= ADVERTISE_INTERVAL)
         {
             checked_at = Some(Instant::now());
-            if advertisement.is_none() {
-                advertisement = Advertisement::new(&addresses).ok();
-            }
-            if let Some(advertisement) = &advertisement
-                && advertisement.publish(&details, viewers).is_ok()
+            if advertisement.is_none()
+                && let Ok(advertising) = Advertisement::new(&addresses)
             {
-                announced_viewers = Some(viewers);
+                let interfaces = listeners
+                    .iter()
+                    .filter_map(|(_, network)| network.clone())
+                    .collect();
+                let host = Arc::downgrade(state);
+                let room_id = format!("{}.{SERVICE_TYPE}", advertising.instance);
+                let _ = crate::reverse::watch(
+                    &advertising.daemon,
+                    room_id,
+                    interfaces,
+                    move |socket| {
+                        if let Some(host) = host.upgrade() {
+                            let _ = start_client(socket, &host);
+                        }
+                    },
+                );
+                advertisement = Some(advertising);
+            }
+            if let Some(advertisement) = &advertisement {
+                let details = state.data.lock().unwrap().details.clone();
+                let viewers = announcement.0;
+                if advertisement.publish(&details, viewers).is_ok() {
+                    announced = Some((viewers, details.height, details.fps));
+                }
             }
         }
         for (listener, network) in listeners {
@@ -394,7 +611,7 @@ fn run_host(
                     None => peer.ip().is_loopback(),
                 };
                 if permitted {
-                    let _ = start_client(socket, state, &details);
+                    let _ = start_client(socket, state);
                 }
             }
         }
@@ -437,6 +654,7 @@ impl Advertisement {
             ("height", details.height.to_string()),
             ("fps", details.fps.to_string()),
             ("viewers", viewers.to_string()),
+            ("video", "2".to_owned()),
         ];
         let mut service = ServiceInfo::new(
             SERVICE_TYPE,
@@ -469,6 +687,48 @@ struct Client {
     watching: bool,
 }
 
+impl Client {
+    fn reserve_channel(&self, channel: Channel) -> io::Result<()> {
+        let mut data = self.host.data.lock().unwrap();
+        if data
+            .clients
+            .values()
+            .filter(|client| client.channel == Some(channel))
+            .count()
+            >= MAX_VIEWERS
+        {
+            return Err(io::Error::other(
+                "The broadcast has reached its viewer limit",
+            ));
+        }
+        if let Some(connection) = data.clients.get_mut(&self.id) {
+            connection.channel = Some(channel);
+        }
+        Ok(())
+    }
+
+    fn record_delivery(&self, sent_at: Instant, credits: u8) {
+        let updated = Instant::now();
+        let sample = updated.duration_since(sent_at);
+        let mut data = self.host.data.lock().unwrap();
+        let Some(connection) = data.clients.get_mut(&self.id) else {
+            return;
+        };
+        if let Some(delivery) = &mut connection.delivery {
+            delivery.average = (delivery.average * 7 + sample) / 8;
+            delivery.samples = delivery.samples.saturating_add(1);
+            delivery.updated = updated;
+        } else {
+            connection.delivery = Some(Delivery {
+                average: sample,
+                samples: 1,
+                updated,
+                credits,
+            });
+        }
+    }
+}
+
 impl Drop for Client {
     fn drop(&mut self) {
         let mut data = self.host.data.lock().unwrap();
@@ -479,23 +739,29 @@ impl Drop for Client {
     }
 }
 
-fn start_client(socket: TcpStream, host: &Arc<HostState>, details: &RoomDetails) -> io::Result<()> {
-    let id = {
+fn start_client(socket: TcpStream, host: &Arc<HostState>) -> io::Result<()> {
+    let (id, details) = {
         let mut data = host.data.lock().unwrap();
-        if data.stopped || data.clients.len() >= MAX_VIEWERS {
+        if data.stopped || data.clients.len() >= MAX_VIEWERS * 2 {
             return Ok(());
         }
         let id = data.next_client;
-        data.clients.insert(id, socket.try_clone()?);
+        data.clients.insert(
+            id,
+            Connection {
+                socket: socket.try_clone()?,
+                delivery: None,
+                channel: None,
+            },
+        );
         data.next_client += 1;
-        id
+        (id, data.details.clone())
     };
     let client = Client {
         host: Arc::clone(host),
         id,
         watching: false,
     };
-    let details = details.clone();
     thread::Builder::new()
         .name("arcane-client".into())
         .spawn(move || {
@@ -513,22 +779,41 @@ fn stream_frames(
     socket.set_nodelay(true)?;
     socket.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     socket.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
-    read_magic(&mut socket)?;
-
-    let metadata = serde_json::to_vec(details).map_err(io::Error::other)?;
-    socket.write_all(&MAGIC)?;
-    socket.write_all(&(metadata.len() as u16).to_be_bytes())?;
-    socket.write_all(&metadata)?;
+    let mut magic = [0; MAGIC.len()];
+    socket.read_exact(&mut magic)?;
+    let credits = match magic {
+        MAGIC => 1,
+        FAST_MAGIC => VIDEO_CREDITS,
+        AUDIO_MAGIC => {
+            client.reserve_channel(Channel::Audio)?;
+            write_handshake(&mut socket, &magic, details)?;
+            return stream_audio(socket, &client.host);
+        }
+        _ => {
+            return Err(invalid_data(
+                "This is not a compatible Arcane Portal stream",
+            ));
+        }
+    };
+    client.reserve_channel(Channel::Video)?;
+    write_handshake(&mut socket, &magic, details)?;
     socket.set_read_timeout(Some(IO_TIMEOUT))?;
     socket.set_write_timeout(Some(IO_TIMEOUT))?;
 
     let mut request = [0];
     let mut previous = 0;
+    let mut sent_at = VecDeque::with_capacity(credits);
     loop {
         // Request one frame only after decoding the last. Slow viewers skip stale frames.
         socket.read_exact(&mut request)?;
         if request != FRAME_REQUEST {
             return Err(invalid_data("Unexpected frame request"));
+        }
+        if sent_at.len() == credits
+            && let Some(acknowledged) = sent_at.pop_front()
+        {
+            // Each replenished credit acknowledges the earliest outstanding JPEG.
+            client.record_delivery(acknowledged, credits as u8);
         }
         let (sequence, jpeg, viewers) = wait_for_frame(&client.host, previous)?;
         let viewers = if client.watching {
@@ -542,9 +827,60 @@ fn stream_frames(
         let mut header = [0; 5];
         header[..4].copy_from_slice(&(jpeg.len() as u32).to_be_bytes());
         header[4] = viewers as u8;
+        sent_at.push_back(Instant::now());
         socket.write_all(&header)?;
         socket.write_all(&jpeg)?;
         previous = sequence;
+    }
+}
+
+fn write_handshake(
+    socket: &mut TcpStream,
+    magic: &[u8; 8],
+    details: &RoomDetails,
+) -> io::Result<()> {
+    let metadata = serde_json::to_vec(details).map_err(io::Error::other)?;
+    let mut reply = Vec::with_capacity(magic.len() + 2 + metadata.len());
+    reply.extend_from_slice(magic);
+    reply.extend_from_slice(&(metadata.len() as u16).to_be_bytes());
+    reply.extend_from_slice(&metadata);
+    socket.write_all(&reply)
+}
+
+fn stream_audio(mut socket: TcpStream, host: &HostState) -> io::Result<()> {
+    socket.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let mut previous = 0;
+    let mut message = [0; PACKET_BYTES + 1];
+    message[0] = 1;
+    loop {
+        let samples = {
+            let data = host.data.lock().unwrap();
+            let available = |packet: &AudioPacket| {
+                packet.sequence > previous && packet.captured.elapsed() <= AUDIO_FRESHNESS
+            };
+            let (data, _) = host
+                .audio_ready
+                .wait_timeout_while(data, Duration::from_millis(500), |data| {
+                    !data.stopped && !data.audio.back().is_some_and(available)
+                })
+                .unwrap();
+            if data.stopped {
+                return Ok(());
+            }
+            data.audio
+                .iter()
+                .find(|packet| available(packet))
+                .map(|packet| {
+                    previous = packet.sequence;
+                    Arc::clone(&packet.samples)
+                })
+        };
+        if let Some(samples) = samples {
+            message[1..].copy_from_slice(&samples);
+            socket.write_all(&message)?;
+        } else {
+            socket.write_all(&[0])?;
+        }
     }
 }
 
@@ -585,40 +921,82 @@ pub struct Viewer {
 struct ViewerState {
     stopped: bool,
     socket: Option<TcpStream>,
+    audio_socket: Option<TcpStream>,
     frame: Option<Arc<Frame>>,
     room: Option<Room>,
     error: Option<String>,
+    fps: FrameRate,
+    audio: VecDeque<Arc<[u8]>>,
+    audio_error: Option<String>,
+}
+
+#[derive(Clone)]
+struct JoinPlan {
+    candidates: Vec<SocketAddrV4>,
+    interfaces: Vec<Ifv4Addr>,
+    identity: Option<(String, String)>,
+    service_id: Option<String>,
+    fast_video: bool,
+}
+
+impl JoinPlan {
+    fn reverse(&self, cancelled: impl Fn() -> bool) -> io::Result<TcpStream> {
+        let room_id = self
+            .service_id
+            .as_deref()
+            .ok_or(io::ErrorKind::Unsupported)?;
+        crate::reverse::receive(room_id, &self.candidates, &self.interfaces, cancelled)
+    }
 }
 
 impl Viewer {
-    pub fn connect(address: SocketAddrV4) -> Result<Self, String> {
-        if address.port() == 0
-            || (!address.ip().is_loopback()
-                && !lan_interfaces()
-                    .iter()
-                    .any(|interface| same_lan(interface, *address.ip())))
-        {
+    pub fn join(room: &Room) -> Result<Self, String> {
+        let candidates = std::iter::once(room.address)
+            .chain(room.alternatives.iter().copied())
+            .collect();
+        let identity = (room.name.clone(), room.title.clone());
+        Self::start(
+            candidates,
+            Some(identity),
+            room.service_id.clone(),
+            room.fast_video,
+        )
+    }
+
+    #[cfg(test)]
+    fn connect(address: SocketAddrV4) -> Result<Self, String> {
+        Self::start(vec![address], None, None, false)
+    }
+
+    fn start(
+        mut candidates: Vec<SocketAddrV4>,
+        identity: Option<(String, String)>,
+        service_id: Option<String>,
+        fast_video: bool,
+    ) -> Result<Self, String> {
+        let interfaces = lan_interfaces();
+        candidates.retain(|address| {
+            address.port() != 0
+                && (address.ip().is_loopback()
+                    || interfaces
+                        .iter()
+                        .any(|interface| same_lan(interface, *address.ip())))
+        });
+        if candidates.is_empty() {
             return Err("This room is no longer reachable on your local network.".into());
         }
         let state = Arc::new(Mutex::new(ViewerState::default()));
         let worker = Arc::clone(&state);
+        let plan = JoinPlan {
+            candidates,
+            interfaces,
+            identity,
+            service_id,
+            fast_video,
+        };
         thread::Builder::new()
             .name("arcane-viewer".into())
-            .spawn(move || {
-                let result = receive_frames(address, &worker);
-                let mut state = worker.lock().unwrap();
-                state.socket = None;
-                if !state.stopped
-                    && let Err(error) = result
-                {
-                    let context = if state.room.is_some() {
-                        "The broadcast ended or the connection was lost."
-                    } else {
-                        "Could not join this broadcast."
-                    };
-                    state.error = Some(format!("{context} {error}"));
-                }
-            })
+            .spawn(move || run_viewer(&worker, &plan))
             .map_err(|error| format!("Could not start the viewer. {error}"))?;
         Ok(Self { state })
     }
@@ -634,23 +1012,109 @@ impl Viewer {
     pub fn error(&self) -> Option<String> {
         self.state.lock().unwrap().error.clone()
     }
+
+    pub fn stream_fps(&self) -> f32 {
+        self.state.lock().unwrap().fps.get()
+    }
+
+    pub fn take_audio_packets(&self) -> Vec<Arc<[u8]>> {
+        self.state.lock().unwrap().audio.drain(..).collect()
+    }
+
+    pub fn audio_error(&self) -> Option<String> {
+        self.state.lock().unwrap().audio_error.clone()
+    }
 }
 
 impl Drop for Viewer {
     fn drop(&mut self) {
         let mut state = self.state.lock().unwrap();
         state.stopped = true;
-        if let Some(socket) = state.socket.take() {
+        let sockets = [state.socket.take(), state.audio_socket.take()];
+        for socket in sockets.into_iter().flatten() {
             let _ = socket.shutdown(Shutdown::Both);
         }
     }
 }
 
-fn receive_frames(address: SocketAddrV4, viewer: &Mutex<ViewerState>) -> io::Result<()> {
-    let mut socket = TcpStream::connect_timeout(&SocketAddr::V4(address), HANDSHAKE_TIMEOUT)?;
-    socket.set_nodelay(true)?;
-    socket.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-    socket.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
+#[derive(Default)]
+struct JoinDiagnostics {
+    direct: Option<io::Error>,
+    first_frame: Option<io::Error>,
+}
+
+fn run_viewer(viewer: &Arc<Mutex<ViewerState>>, plan: &JoinPlan) {
+    let mut diagnostics = JoinDiagnostics::default();
+    for &address in &plan.candidates {
+        let result = TcpStream::connect_timeout(&SocketAddr::V4(address), HANDSHAKE_TIMEOUT)
+            .and_then(|socket| receive_frames(socket, address, plan, viewer, false));
+        if finish_attempt(viewer, result, &mut diagnostics) {
+            return;
+        }
+    }
+    if plan.service_id.is_some() {
+        let result = plan
+            .reverse(|| viewer.lock().unwrap().stopped)
+            .and_then(|socket| receive_frames(socket, plan.candidates[0], plan, viewer, true));
+        if finish_attempt(viewer, result, &mut diagnostics) {
+            return;
+        }
+    }
+
+    let mut viewer = viewer.lock().unwrap();
+    if viewer.stopped {
+        return;
+    }
+    viewer.error = Some(if let Some(error) = diagnostics.first_frame {
+        format!("The host connected, but did not send a usable first frame. {error}")
+    } else {
+        let detail = diagnostics
+            .direct
+            .map_or_else(String::new, |error| format!(" {error}"));
+        format!(
+            "The room was discovered, but the video connection failed. Check that both devices can communicate on the local network and that Arcane Portal is allowed through the broadcaster's firewall.{detail}"
+        )
+    });
+}
+
+fn finish_attempt(
+    viewer: &Mutex<ViewerState>,
+    result: io::Result<()>,
+    diagnostics: &mut JoinDiagnostics,
+) -> bool {
+    let mut state = viewer.lock().unwrap();
+    state.socket = None;
+    if state.stopped {
+        return true;
+    }
+    let Err(error) = result else {
+        return true;
+    };
+    if state.frame.is_some() {
+        state.error = Some(format!(
+            "The broadcast ended or the connection was lost. {error}"
+        ));
+        state.audio.clear();
+        if let Some(socket) = state.audio_socket.take() {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
+        return true;
+    }
+    if state.room.take().is_some() {
+        diagnostics.first_frame.get_or_insert(error);
+    } else {
+        diagnostics.direct.get_or_insert(error);
+    }
+    false
+}
+
+fn receive_frames(
+    mut socket: TcpStream,
+    address: SocketAddrV4,
+    plan: &JoinPlan,
+    viewer: &Arc<Mutex<ViewerState>>,
+    used_reverse: bool,
+) -> io::Result<()> {
     {
         let mut state = viewer.lock().unwrap();
         if state.stopped {
@@ -658,8 +1122,66 @@ fn receive_frames(address: SocketAddrV4, viewer: &Mutex<ViewerState>) -> io::Res
         }
         state.socket = Some(socket.try_clone()?);
     }
-    socket.write_all(&MAGIC)?;
-    read_magic(&mut socket)?;
+    let (magic, credits) = if plan.fast_video {
+        (FAST_MAGIC, VIDEO_CREDITS)
+    } else {
+        (MAGIC, 1)
+    };
+    let details = negotiate(&mut socket, &magic, plan.identity.as_ref())?;
+    viewer.lock().unwrap().room = Some(details.into_room(address, 0));
+    socket.set_read_timeout(Some(IO_TIMEOUT))?;
+    socket.write_all(&[FRAME_REQUEST[0]; VIDEO_CREDITS][..credits])?;
+
+    let mut jpeg = Vec::new();
+    let mut header = [0; 5];
+    let mut first_frame = true;
+    loop {
+        socket.read_exact(&mut header)?;
+        let length = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+        if length == 0 || length > MAX_JPEG_BYTES {
+            return Err(invalid_data("Invalid screen frame size"));
+        }
+        jpeg.resize(length, 0);
+        socket.read_exact(&mut jpeg)?;
+        let frame = decode_frame(&jpeg)?;
+        let height = frame.height;
+        {
+            let mut state = viewer.lock().unwrap();
+            if state.stopped {
+                return Ok(());
+            }
+            state.frame = Some(Arc::new(frame));
+            state.fps.record();
+            if let Some(room) = &mut state.room {
+                room.height = height;
+                room.viewers = usize::from(header[4]).min(MAX_VIEWERS);
+            }
+        }
+        if first_frame && plan.fast_video {
+            start_audio_receiver(viewer, plan, address, used_reverse);
+            first_frame = false;
+        }
+        socket.write_all(&FRAME_REQUEST)?;
+    }
+}
+
+fn negotiate(
+    socket: &mut TcpStream,
+    magic: &[u8; 8],
+    identity: Option<&(String, String)>,
+) -> io::Result<RoomDetails> {
+    socket.set_nonblocking(false)?;
+    socket.set_nodelay(true)?;
+    socket.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    socket.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    socket.write_all(magic)?;
+    let mut response = [0; 8];
+    socket.read_exact(&mut response)?;
+    if response != *magic {
+        return Err(invalid_data(
+            "This is not a compatible Arcane Portal stream",
+        ));
+    }
     let mut length = [0; 2];
     socket.read_exact(&mut length)?;
     let length = usize::from(u16::from_be_bytes(length));
@@ -671,57 +1193,113 @@ fn receive_frames(address: SocketAddrV4, viewer: &Mutex<ViewerState>) -> io::Res
     let details: RoomDetails = serde_json::from_slice(&metadata).map_err(io::Error::other)?;
     let details = RoomDetails::new(&details.name, &details.title, details.height, details.fps)
         .ok_or_else(|| invalid_data("Invalid broadcast information"))?;
-    viewer.lock().unwrap().room = Some(details.into_room(address, 0));
-    socket.set_read_timeout(Some(IO_TIMEOUT))?;
+    if identity.is_some_and(|(name, title)| details.name != *name || details.title != *title) {
+        return Err(invalid_data(
+            "The host is now sharing a different broadcast",
+        ));
+    }
+    Ok(details)
+}
 
-    let mut jpeg = Vec::new();
-    let mut header = [0; 5];
-    loop {
-        socket.write_all(&FRAME_REQUEST)?;
-        socket.read_exact(&mut header)?;
-        let length = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
-        if length == 0 || length > MAX_JPEG_BYTES {
-            return Err(invalid_data("Invalid screen frame size"));
-        }
-        jpeg.resize(length, 0);
-        socket.read_exact(&mut jpeg)?;
-        let frame = decode_frame(&jpeg)?;
-        let mut state = viewer.lock().unwrap();
-        if state.stopped {
-            return Ok(());
-        }
-        state.frame = Some(Arc::new(frame));
-        if let Some(room) = &mut state.room {
-            room.viewers = usize::from(header[4]).min(MAX_VIEWERS);
-        }
+fn start_audio_receiver(
+    viewer: &Arc<Mutex<ViewerState>>,
+    plan: &JoinPlan,
+    address: SocketAddrV4,
+    used_reverse: bool,
+) {
+    let plan = plan.clone();
+    let state = Arc::clone(viewer);
+    if let Err(error) = thread::Builder::new()
+        .name("arcane-viewer-audio".into())
+        .spawn(move || {
+            let cancelled = || {
+                let state = state.lock().unwrap();
+                state.stopped || state.error.is_some()
+            };
+            let direct = (!used_reverse).then(|| {
+                let mut socket = TcpStream::connect_timeout(&address.into(), HANDSHAKE_TIMEOUT)?;
+                negotiate(&mut socket, &AUDIO_MAGIC, plan.identity.as_ref())?;
+                Ok::<TcpStream, io::Error>(socket)
+            });
+            let connection = direct.and_then(Result::ok).map_or_else(
+                || {
+                    let mut socket = plan.reverse(cancelled)?;
+                    negotiate(&mut socket, &AUDIO_MAGIC, plan.identity.as_ref())?;
+                    Ok(socket)
+                },
+                Ok,
+            );
+            let result = connection.and_then(|socket| receive_audio(socket, &state));
+            let mut state = state.lock().unwrap();
+            state.audio_socket = None;
+            if let Err(error) = result
+                && !state.stopped
+                && state.error.is_none()
+            {
+                state.audio_error = Some(format!(
+                    "Could not receive the broadcaster's audio. {error}"
+                ));
+            }
+        })
+    {
+        viewer.lock().unwrap().audio_error =
+            Some(format!("Could not start the audio connection. {error}"));
     }
 }
 
-fn read_magic(socket: &mut TcpStream) -> io::Result<()> {
-    let mut magic = [0; MAGIC.len()];
-    socket.read_exact(&mut magic)?;
-    if magic == MAGIC {
-        Ok(())
-    } else {
-        Err(invalid_data(
-            "This is not a compatible Arcane Portal broadcast",
-        ))
+fn receive_audio(mut socket: TcpStream, viewer: &Mutex<ViewerState>) -> io::Result<()> {
+    socket.set_read_timeout(Some(IO_TIMEOUT))?;
+    {
+        let mut state = viewer.lock().unwrap();
+        if state.stopped || state.error.is_some() {
+            return Ok(());
+        }
+        state.audio_socket = Some(socket.try_clone()?);
+    }
+    let mut kind = [0; 1];
+    let mut samples = [0; PACKET_BYTES];
+    loop {
+        socket.read_exact(&mut kind)?;
+        match kind[0] {
+            0 => continue,
+            1 => socket.read_exact(&mut samples)?,
+            _ => return Err(invalid_data("Invalid system audio packet")),
+        }
+        let mut state = viewer.lock().unwrap();
+        if state.stopped || state.error.is_some() {
+            return Ok(());
+        }
+        if state.audio.len() == AUDIO_BUFFER {
+            state.audio.pop_front();
+        }
+        state.audio.push_back(Arc::from(samples));
     }
 }
 
 fn decode_frame(jpeg: &[u8]) -> io::Result<Frame> {
-    let decoder = JpegDecoder::new(Cursor::new(jpeg)).map_err(io::Error::other)?;
-    let (width, height) = decoder.dimensions();
+    let options = DecoderOptions::default()
+        .set_max_width(4096)
+        .set_max_height(1600)
+        .jpeg_set_out_colorspace(ColorSpace::RGBA);
+    let mut decoder = JpegDecoder::new_with_options(ZCursor::new(jpeg), options);
+    decoder
+        .decode_headers()
+        .map_err(|_| invalid_data("Invalid JPEG frame"))?;
+    let (width, height) = decoder
+        .dimensions()
+        .ok_or_else(|| invalid_data("Missing screen dimensions"))?;
     if width == 0 || height == 0 || width > 4096 || height > 1600 || width * height > 4_000_000 {
         return Err(invalid_data("Invalid screen frame dimensions"));
     }
-    let rgba = DynamicImage::from_decoder(decoder)
-        .map_err(io::Error::other)?
-        .into_rgba8()
-        .into_raw();
+    let rgba = decoder
+        .decode()
+        .map_err(|_| invalid_data("Could not decode the JPEG frame"))?;
+    if rgba.len() != width * height * 4 {
+        return Err(invalid_data("Invalid decoded screen frame length"));
+    }
     Ok(Frame {
-        width,
-        height,
+        width: width as u32,
+        height: height as u32,
         rgba,
     })
 }
@@ -765,6 +1343,81 @@ mod tests {
     }
 
     #[test]
+    fn tries_another_advertised_address_when_first_frame_fails() {
+        let details = RoomDetails::new("Host", "Shared window", 720, 24).unwrap();
+        let first = Host::listen(details.clone(), 0, Vec::new()).unwrap();
+        let second = Host::listen(details.clone(), 0, Vec::new()).unwrap();
+        (first.publisher())(Arc::from(&b"invalid JPEG"[..]));
+        (second.publisher())(test_frame().into());
+        let mut room = details.into_room(first.addresses()[0], 0);
+        room.alternatives.push(second.addresses()[0]);
+
+        let viewer = Viewer::join(&room).unwrap();
+        eventually(|| viewer.frame().is_some());
+        assert_eq!(viewer.room().unwrap().address, second.addresses()[0]);
+        assert!(viewer.error().is_none());
+    }
+
+    #[test]
+    fn existing_viewers_can_decode_a_new_size_after_a_format_change() {
+        let details = RoomDetails::new("Host", "Shared window", 720, 24).unwrap();
+        let host = Host::listen(details, 0, Vec::new()).unwrap();
+        let address = host.addresses()[0];
+        let publish = host.publisher();
+        publish(test_frame().into());
+        let viewer = Viewer::connect(address).unwrap();
+        eventually(|| viewer.frame().is_some());
+        assert_eq!(viewer.room().unwrap().fps, 24);
+
+        host.set_format(1080, 60);
+        let mut jpeg = Vec::new();
+        JpegEncoder::new(&mut jpeg)
+            .encode(&[121; 4 * 4 * 3], 4, 4, ExtendedColorType::Rgb8)
+            .unwrap();
+        let jpeg: Arc<[u8]> = jpeg.into();
+        eventually(|| {
+            publish(jpeg.clone());
+            host.network_fps_limit().is_some()
+                && viewer.frame().is_some_and(|frame| frame.height == 4)
+        });
+        assert!(viewer.error().is_none());
+
+        let new_viewer = Viewer::connect(address).unwrap();
+        eventually(|| new_viewer.frame().is_some());
+        assert_eq!(new_viewer.room().unwrap().fps, 60);
+        assert_eq!(new_viewer.room().unwrap().height, 4);
+    }
+
+    #[test]
+    fn pipelined_video_and_optional_audio_share_a_room() {
+        let details = RoomDetails::new("Host", "Audio and video", 720, 60).unwrap();
+        let host = Host::listen(details.clone(), 0, Vec::new()).unwrap();
+        let mut room = details.into_room(host.addresses()[0], 0);
+        room.fast_video = true;
+        let video = host.publisher();
+        let jpeg: Arc<[u8]> = test_frame().into();
+        video(jpeg.clone());
+        let viewer = Viewer::join(&room).unwrap();
+        eventually(|| viewer.frame().is_some());
+        let audio = host.audio_publisher();
+        let samples: Arc<[u8]> = vec![19; PACKET_BYTES].into();
+        eventually(|| {
+            video(jpeg.clone());
+            audio(samples.clone());
+            viewer
+                .take_audio_packets()
+                .iter()
+                .any(|packet| packet.as_ref() == samples.as_ref())
+        });
+        assert!(viewer.stream_fps() > 0.0 && host.stream_fps() > 0.0);
+        assert_eq!(host.viewers(), 1);
+        host.clear_audio();
+        audio(vec![77; PACKET_BYTES].into());
+        assert!(host.state.data.lock().unwrap().audio.is_empty());
+        assert!(viewer.audio_error().is_none());
+    }
+
+    #[test]
     #[ignore = "requires an active private interface with multicast enabled"]
     fn discovers_live_rooms_and_removes_stopped_rooms() {
         let interfaces = lan_interfaces();
@@ -787,7 +1440,7 @@ mod tests {
         eventually_for(Duration::from_secs(12), "room never appeared", || {
             room().is_some()
         });
-        let viewer = Viewer::connect(room().unwrap().address).unwrap();
+        let viewer = Viewer::join(&room().unwrap()).unwrap();
         eventually(|| viewer.frame().is_some());
         eventually_for(
             Duration::from_secs(6),
@@ -804,6 +1457,56 @@ mod tests {
             "room did not disappear after stopping",
             || room().is_none(),
         );
+    }
+
+    #[test]
+    #[ignore = "requires an active private interface with multicast enabled"]
+    fn discovered_room_uses_return_connection_when_direct_tcp_is_unavailable() {
+        let interfaces = lan_interfaces();
+        assert!(!interfaces.is_empty(), "no active private IPv4 interfaces");
+        let discovery = Discovery::start().unwrap();
+        let details = RoomDetails::new("Arcane test", "Return connection", 720, 24).unwrap();
+        let host = Host::listen(details, 0, interfaces).unwrap();
+        let addresses = host.addresses();
+        (host.publisher())(test_frame().into());
+        let find_room = || {
+            discovery
+                .rooms()
+                .into_iter()
+                .find(|room| room.title == "Return connection" && addresses.contains(&room.address))
+        };
+        eventually_for(Duration::from_secs(12), "room never appeared", || {
+            find_room().is_some()
+        });
+
+        let unused_port = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut room = find_room().unwrap();
+        room.address.set_port(unused_port);
+        for address in &mut room.alternatives {
+            address.set_port(unused_port);
+        }
+        let viewer = Viewer::join(&room).unwrap();
+        eventually_for(
+            Duration::from_secs(15),
+            "no return video connection",
+            || viewer.frame().is_some() || viewer.error().is_some(),
+        );
+        assert!(viewer.frame().is_some(), "{:?}", viewer.error());
+        assert_eq!(viewer.room().unwrap().title, "Return connection");
+        assert_eq!(host.viewers(), 1);
+        let audio = host.audio_publisher();
+        let packet: Arc<[u8]> = vec![48; PACKET_BYTES].into();
+        eventually_for(Duration::from_secs(9), "no return audio connection", || {
+            audio(packet.clone());
+            viewer
+                .take_audio_packets()
+                .iter()
+                .any(|received| received.as_ref() == packet.as_ref())
+        });
     }
 
     #[test]

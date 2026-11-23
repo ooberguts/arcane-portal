@@ -27,14 +27,18 @@ In **Settings → Updates**, check GitHub for a newer release. If an update is a
 ## Share your screen
 
 1. Open **Settings** to set the display name people see in Live Rooms. Arcane Portal uses your computer name by default.
-2. Open **Broadcast**, choose a screen or window, pick a quality preset, and choose **Go live**. A local preview shows what the viewers receive.
+2. Open **Broadcast**, choose a screen or window, and choose **Go live**. A local preview shows what the viewers receive.
 3. Viewers on your network can find the broadcast in **Live Rooms**. **Stop broadcast** ends the stream for everyone.
 
-Quality presets target 480p at 15 fps, 720p at 24 fps, or 1080p at 30 fps. Actual resolution depends on the source and its aspect ratio. Capture is video-only.
+Set **Resolution** and **Frame rate** independently before going live or while broadcasting. Resolution can target 480p, 720p, or 1080p. Frame rate can target 15, 24, 30, or 60 FPS. Each control has an **Auto** setting that adjusts based on capture and viewer delivery. The live FPS counters show how many frames the host sends and the viewer decodes. Resolution retains the source's aspect ratio.
+
+Turn on **Share system audio** in **Broadcast** when you want viewers to hear sound playing on your computer. You can switch it on or off while live. Viewers can toggle playback or go fullscreen from the watch screen. Update both devices for the faster video transport and audio support.
 
 ## Network behavior
 
-Rooms are open to Arcane Portal clients on a directly connected private IPv4 subnet. Stream traffic is unencrypted, so use it on a trusted network. The app uses mDNS discovery (UDP 5353) and a direct TCP connection, normally on port 48742. Sharing and watching work offline. Update checks and downloads use GitHub.
+Rooms are open to Arcane Portal clients on a directly connected private IPv4 subnet. Stream traffic is unencrypted, so use it on a trusted network. The app uses mDNS discovery (UDP 5353) and a direct TCP connection, normally on port 48742. If that inbound connection fails, current versions can have the broadcaster initiate a TCP connection to the viewer. Sharing and watching work offline. Update checks and downloads use GitHub.
+
+If a room appears but cannot connect, verify that both devices are on the same trusted network. On a Windows broadcaster, use the **Private** network profile for trusted Wi-Fi and allow Arcane Portal through the firewall on that profile. On macOS, allow Local Network access when prompted.
 
 ## Build from source
 

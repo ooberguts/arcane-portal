@@ -1,38 +1,80 @@
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::Frame;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Quality {
-    Low,
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub enum Resolution {
     #[default]
-    Standard,
-    High,
+    Auto,
+    P480,
+    P720,
+    P1080,
 }
 
-impl Quality {
+impl Resolution {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Low => "480p / 15 fps",
-            Self::Standard => "720p / 24 fps",
-            Self::High => "1080p / 30 fps",
+            Self::Auto => "Auto",
+            Self::P480 => "480p",
+            Self::P720 => "720p",
+            Self::P1080 => "1080p",
         }
     }
 
-    pub fn height(self) -> u32 {
+    fn initial_height(self) -> u32 {
         match self {
-            Self::Low => 480,
-            Self::Standard => 720,
-            Self::High => 1080,
+            Self::P480 => 480,
+            Self::Auto | Self::P720 => 720,
+            Self::P1080 => 1080,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub enum FrameRate {
+    #[default]
+    Auto,
+    Fps15,
+    Fps24,
+    Fps30,
+    Fps60,
+}
+
+impl FrameRate {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Fps15 => "15 fps",
+            Self::Fps24 => "24 fps",
+            Self::Fps30 => "30 fps",
+            Self::Fps60 => "60 fps",
         }
     }
 
-    pub fn fps(self) -> u32 {
+    fn initial_fps(self) -> u32 {
         match self {
-            Self::Low => 15,
-            Self::Standard => 24,
-            Self::High => 30,
+            Self::Fps15 => 15,
+            Self::Auto | Self::Fps24 => 24,
+            Self::Fps30 => 30,
+            Self::Fps60 => 60,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct VideoSettings {
+    pub resolution: Resolution,
+    pub frame_rate: FrameRate,
+}
+
+impl VideoSettings {
+    pub fn initial_format(self) -> (u32, u32) {
+        (
+            self.resolution.initial_height(),
+            self.frame_rate.initial_fps(),
+        )
     }
 }
 
@@ -51,31 +93,188 @@ pub enum SourceKind {
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 mod native {
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::mpsc::{self, Receiver};
+    use std::sync::{Condvar, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use image::codecs::jpeg::JpegEncoder;
-    use image::{RgbaImage, imageops};
+    use fast_image_resize::{ResizeOptions, Resizer};
+    use image::RgbaImage;
+    use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
 
     use super::*;
 
     const CAPTURE_POLL: Duration = Duration::from_millis(100);
     const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(8);
     const STATIC_FRAME_INTERVAL: Duration = Duration::from_secs(2);
+    const AUTO_COOLDOWN: Duration = Duration::from_secs(1);
+    const AUTO_UPGRADE_COOLDOWN: Duration = Duration::from_secs(3);
+    const RESOLUTIONS: [u32; 3] = [480, 720, 1080];
+    const FRAME_RATES: [u32; 4] = [15, 24, 30, 60];
     const SOURCE_GONE: &str =
         "The selected source changed or closed. Refresh the list and select it again.";
 
-    #[derive(Default)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Format {
+        height: u32,
+        fps: u32,
+    }
+
+    struct Controls {
+        settings: VideoSettings,
+        format: Format,
+        network_fps_limit: Option<u32>,
+        encode_seconds: f64,
+        samples: u8,
+        last_change: Instant,
+    }
+
+    impl Controls {
+        fn new(settings: VideoSettings) -> Self {
+            let (height, fps) = settings.initial_format();
+            Self {
+                settings,
+                format: Format { height, fps },
+                network_fps_limit: None,
+                encode_seconds: 0.0,
+                samples: 0,
+                last_change: Instant::now(),
+            }
+        }
+
+        fn set_settings(&mut self, settings: VideoSettings) {
+            let mut format = self.format;
+            if self.settings.resolution != settings.resolution {
+                format.height = settings.resolution.initial_height();
+            }
+            if self.settings.frame_rate != settings.frame_rate {
+                format.fps = settings.frame_rate.initial_fps();
+            }
+            if settings != self.settings {
+                self.settings = settings;
+                self.set_format(format, Instant::now());
+            }
+        }
+
+        fn set_format(&mut self, format: Format, now: Instant) {
+            self.format = format;
+            self.samples = 0;
+            self.last_change = now;
+        }
+
+        fn record_encode(&mut self, format: Format, elapsed: Duration, now: Instant) {
+            if self.format != format {
+                return;
+            }
+            let seconds = elapsed.as_secs_f64();
+            self.encode_seconds = if self.samples == 0 {
+                seconds
+            } else {
+                self.encode_seconds * 0.8 + seconds * 0.2
+            };
+            self.samples = self.samples.saturating_add(1);
+            let age = now.saturating_duration_since(self.last_change);
+            if self.samples < 8 || age < AUTO_COOLDOWN {
+                return;
+            }
+
+            // Leave a little CPU headroom for scheduling and preview work.
+            let mut capacity = 0.85 / self.encode_seconds.max(0.001);
+            if let Some(network) = self.network_fps_limit {
+                capacity = capacity.min(f64::from(network));
+            }
+            let target = adaptive_format(
+                self.settings,
+                format,
+                capacity,
+                age >= AUTO_UPGRADE_COOLDOWN,
+            );
+            if target != format {
+                self.set_format(target, now);
+            }
+        }
+    }
+
+    fn adaptive_format(
+        settings: VideoSettings,
+        format: Format,
+        capacity: f64,
+        can_upgrade: bool,
+    ) -> Format {
+        let auto_resolution = settings.resolution == Resolution::Auto;
+        let auto_fps = settings.frame_rate == FrameRate::Auto;
+        let target = f64::from(format.fps);
+        let minimum_smooth_fps = if auto_fps { target.min(24.0) } else { target };
+        let smaller = RESOLUTIONS
+            .into_iter()
+            .rev()
+            .find(|height| *height < format.height);
+        if auto_resolution
+            && capacity < minimum_smooth_fps * 0.95
+            && let Some(height) = smaller
+        {
+            return Format { height, ..format };
+        }
+        if auto_fps && capacity < target * 0.95 {
+            return Format {
+                fps: sustainable_fps(capacity),
+                ..format
+            };
+        }
+        if !can_upgrade {
+            return format;
+        }
+        if auto_resolution
+            && let Some(height) = RESOLUTIONS
+                .into_iter()
+                .find(|height| *height > format.height)
+        {
+            // JPEG size and work broadly follow pixel count. Require headroom before trying a larger frame.
+            let projected = capacity * (f64::from(format.height) / f64::from(height)).powi(2);
+            let target_after_growth = if auto_fps { target.min(30.0) } else { target };
+            if projected >= target_after_growth * 1.2 {
+                let fps = if auto_fps {
+                    format.fps.min(sustainable_fps(projected / 1.2))
+                } else {
+                    format.fps
+                };
+                return Format { height, fps };
+            }
+        }
+        if auto_fps
+            && let Some(fps) = FRAME_RATES.into_iter().find(|fps| *fps > format.fps)
+            && capacity >= f64::from(fps) * 1.2
+        {
+            return Format { fps, ..format };
+        }
+        format
+    }
+
+    fn sustainable_fps(capacity: f64) -> u32 {
+        FRAME_RATES
+            .into_iter()
+            .rev()
+            .find(|fps| f64::from(*fps) <= capacity)
+            .unwrap_or(15)
+    }
+
     struct State {
         cancelled: AtomicBool,
         frame: Mutex<Option<Arc<Frame>>>,
         error: Mutex<Option<String>>,
+        controls: Mutex<Controls>,
     }
 
     impl State {
+        fn new(settings: VideoSettings) -> Self {
+            Self {
+                cancelled: AtomicBool::new(false),
+                frame: Mutex::new(None),
+                error: Mutex::new(None),
+                controls: Mutex::new(Controls::new(settings)),
+            }
+        }
+
         fn set_error(&self, message: String) {
             let mut error = self.error.lock().unwrap();
             error.get_or_insert(message);
@@ -83,6 +282,62 @@ mod native {
 
         fn active(&self) -> bool {
             !self.cancelled.load(Ordering::Acquire) && self.error.lock().unwrap().is_none()
+        }
+
+        fn format(&self) -> Format {
+            self.controls.lock().unwrap().format
+        }
+    }
+
+    struct CapturedFrame {
+        image: RgbaImage,
+        read_time: Duration,
+    }
+
+    // A slow encoder should always pick up the newest capture rather than a queued stale one.
+    #[derive(Default)]
+    struct LatestFrame {
+        frame: Mutex<Option<CapturedFrame>>,
+        ready: Condvar,
+    }
+
+    impl LatestFrame {
+        fn put(&self, frame: CapturedFrame) {
+            *self.frame.lock().unwrap() = Some(frame);
+            self.ready.notify_one();
+        }
+
+        fn take(&self, timeout: Duration) -> Option<CapturedFrame> {
+            let frame = self.frame.lock().unwrap();
+            let (mut frame, _) = self
+                .ready
+                .wait_timeout_while(frame, timeout, |frame| frame.is_none())
+                .unwrap();
+            frame.take()
+        }
+    }
+
+    #[derive(Default)]
+    struct FramePacer {
+        next: Option<Instant>,
+        fps: u32,
+    }
+
+    impl FramePacer {
+        fn permits(&mut self, now: Instant, fps: u32) -> bool {
+            let interval = Duration::from_secs_f64(1.0 / f64::from(fps));
+            if self.fps == fps
+                && let Some(next) = self.next
+            {
+                if now + Duration::from_millis(1) < next {
+                    return false;
+                }
+                self.next = Some((next + interval).max(now + Duration::from_millis(1)));
+            } else {
+                self.next = Some(now + interval);
+            }
+            self.fps = fps;
+            true
         }
     }
 
@@ -93,10 +348,10 @@ mod native {
     impl Capture {
         pub fn start(
             source: Source,
-            quality: Quality,
+            settings: VideoSettings,
             publish: impl Fn(Arc<[u8]>) + Send + 'static,
         ) -> Result<Self, String> {
-            let state = Arc::new(State::default());
+            let state = Arc::new(State::new(settings));
             let capture_state = state.clone();
             thread::Builder::new()
                 .name("arcane-capture".into())
@@ -104,20 +359,13 @@ mod native {
                     if !capture_state.active() {
                         return;
                     }
-                    let (frames, receiver) = mpsc::sync_channel(1);
+                    let frames = Arc::new(LatestFrame::default());
                     let result = platform::capture(
                         &source,
-                        quality,
                         &capture_state,
-                        frames,
+                        frames.clone(),
                         |native_running| {
-                            publish_frames(
-                                &receiver,
-                                quality,
-                                &capture_state,
-                                native_running,
-                                publish,
-                            )
+                            publish_frames(&frames, &capture_state, native_running, publish)
                         },
                     );
                     if let Err(error) = result {
@@ -135,6 +383,19 @@ mod native {
         pub fn error(&self) -> Option<String> {
             self.state.error.lock().unwrap().clone()
         }
+
+        pub fn set_settings(&self, settings: VideoSettings) {
+            self.state.controls.lock().unwrap().set_settings(settings);
+        }
+
+        pub fn set_network_fps_limit(&self, fps_limit: Option<u32>) {
+            self.state.controls.lock().unwrap().network_fps_limit = fps_limit;
+        }
+
+        pub fn format(&self) -> (u32, u32) {
+            let format = self.state.format();
+            (format.height, format.fps)
+        }
     }
 
     impl Drop for Capture {
@@ -148,61 +409,85 @@ mod native {
     }
 
     fn publish_frames(
-        receiver: &Receiver<RgbaImage>,
-        quality: Quality,
+        receiver: &LatestFrame,
         state: &State,
         native_running: &dyn Fn() -> bool,
         publish: impl Fn(Arc<[u8]>),
     ) -> Result<(), String> {
         let began = Instant::now();
         let mut last_sent = began;
+        let mut source = None::<CapturedFrame>;
+        let mut last_height = None;
         let mut last_jpeg = None::<Arc<[u8]>>;
+        let mut resizer = Resizer::new();
 
         while state.active() {
             if !native_running() {
                 return Err("The screen capture session ended.".into());
             }
-            match receiver.recv_timeout(CAPTURE_POLL) {
-                Ok(image) => {
-                    let (width, height) = output_size(image.width(), image.height(), quality);
-                    let image = if image.dimensions() == (width, height) {
-                        image
-                    } else {
-                        imageops::thumbnail(&image, width, height)
-                    };
-                    let jpeg = encode_frame(&image, quality)?;
-                    if !state.active() {
-                        break;
-                    }
-                    *state.frame.lock().unwrap() = Some(Arc::new(Frame {
-                        width,
-                        height,
-                        rgba: image.into_raw(),
-                    }));
+            let new_frame = if let Some(frame) = receiver.take(CAPTURE_POLL) {
+                source = Some(frame);
+                true
+            } else {
+                false
+            };
+            let Some(source) = &source else {
+                if began.elapsed() >= FIRST_FRAME_TIMEOUT {
+                    return Err("The selected source produced no frames. Make sure it is visible and try again.".into());
+                }
+                continue;
+            };
+            if !state.active() {
+                break;
+            }
+            let format = state.format();
+            if !new_frame && last_height == Some(format.height) {
+                if last_sent.elapsed() >= STATIC_FRAME_INTERVAL
+                    && let Some(jpeg) = &last_jpeg
+                {
                     publish(jpeg.clone());
-                    last_jpeg = Some(jpeg);
                     last_sent = Instant::now();
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if let Some(jpeg) = &last_jpeg {
-                        if last_sent.elapsed() >= STATIC_FRAME_INTERVAL && state.active() {
-                            publish(jpeg.clone());
-                            last_sent = Instant::now();
-                        }
-                    } else if began.elapsed() >= FIRST_FRAME_TIMEOUT {
-                        return Err("The selected source produced no frames. Make sure it is visible and try again.".into());
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err("The capture source stopped sending frames.".into());
-                }
+                continue;
+            }
+
+            let started = Instant::now();
+            let image = &source.image;
+            let (width, height) = output_size(image.width(), image.height(), format.height);
+            let (jpeg, rgba) = if image.dimensions() == (width, height) {
+                (encode_frame(image, format.height)?, image.as_raw().clone())
+            } else {
+                let mut resized = RgbaImage::new(width, height);
+                resizer
+                    .resize(image, &mut resized, &ResizeOptions::new().use_alpha(false))
+                    .map_err(|error| format!("Couldn't resize the screen frame: {error}"))?;
+                (encode_frame(&resized, format.height)?, resized.into_raw())
+            };
+            if !state.active() {
+                break;
+            }
+            let elapsed = started.elapsed() + source.read_time;
+            *state.frame.lock().unwrap() = Some(Arc::new(Frame {
+                width,
+                height,
+                rgba,
+            }));
+            publish(jpeg.clone());
+            last_jpeg = Some(jpeg);
+            last_height = Some(format.height);
+            last_sent = Instant::now();
+            if new_frame {
+                state
+                    .controls
+                    .lock()
+                    .unwrap()
+                    .record_encode(format, elapsed, last_sent);
             }
         }
         Ok(())
     }
 
-    fn output_size(width: u32, height: u32, quality: Quality) -> (u32, u32) {
-        let max_height = quality.height();
+    fn output_size(width: u32, height: u32, max_height: u32) -> (u32, u32) {
         let max_width = (max_height * 16).div_ceil(9);
         let scale = (f64::from(max_width) / f64::from(width))
             .min(f64::from(max_height) / f64::from(height))
@@ -211,15 +496,22 @@ mod native {
         (scaled(width), scaled(height))
     }
 
-    fn encode_frame(image: &RgbaImage, quality: Quality) -> Result<Arc<[u8]>, String> {
-        let compression = match quality {
-            Quality::Low => 65,
-            Quality::Standard => 74,
-            Quality::High => 80,
+    fn encode_frame(image: &RgbaImage, height: u32) -> Result<Arc<[u8]>, String> {
+        let compression = match height {
+            480 => 65,
+            720 => 74,
+            _ => 80,
         };
         let mut jpeg = Vec::new();
-        JpegEncoder::new_with_quality(&mut jpeg, compression)
-            .encode_image(image)
+        let width = u16::try_from(image.width())
+            .map_err(|_| "Screen frame is too wide to encode".to_owned())?;
+        let height = u16::try_from(image.height())
+            .map_err(|_| "Screen frame is too tall to encode".to_owned())?;
+        let mut encoder = Encoder::new(&mut jpeg, compression);
+        // Preserve vertical chroma detail for small text while reducing bandwidth and CPU work.
+        encoder.set_sampling_factor(SamplingFactor::F_2_1);
+        encoder
+            .encode(image.as_raw(), width, height, ColorType::Rgba)
             .map_err(|error| format!("Couldn't encode the screen frame: {error}"))?;
         Ok(jpeg.into())
     }
@@ -259,10 +551,126 @@ mod native {
 
         #[test]
         fn resolution_preserves_aspect_ratio_and_never_upscales() {
-            assert_eq!(output_size(3840, 2160, Quality::High), (1920, 1080));
-            assert_eq!(output_size(1080, 1920, Quality::Standard), (405, 720));
-            assert_eq!(output_size(320, 180, Quality::High), (320, 180));
-            assert_eq!(output_size(3440, 1440, Quality::Standard), (1280, 536));
+            assert_eq!(output_size(3840, 2160, 1080), (1920, 1080));
+            assert_eq!(output_size(1080, 1920, 720), (405, 720));
+            assert_eq!(output_size(320, 180, 1080), (320, 180));
+            assert_eq!(output_size(3440, 1440, 720), (1280, 536));
+        }
+
+        #[test]
+        fn auto_adapts_only_the_selected_fields() {
+            let high = Format {
+                height: 1080,
+                fps: 60,
+            };
+            let detailed = VideoSettings {
+                resolution: Resolution::P1080,
+                frame_rate: FrameRate::Auto,
+            };
+            assert_eq!(
+                adaptive_format(detailed, high, 25.0, false),
+                Format { fps: 24, ..high }
+            );
+            let smooth = VideoSettings {
+                resolution: Resolution::Auto,
+                frame_rate: FrameRate::Fps60,
+            };
+            assert_eq!(
+                adaptive_format(smooth, high, 25.0, false),
+                Format {
+                    height: 720,
+                    ..high
+                }
+            );
+            let manual = VideoSettings {
+                resolution: Resolution::P1080,
+                frame_rate: FrameRate::Fps60,
+            };
+            assert_eq!(adaptive_format(manual, high, 10.0, true), high);
+        }
+
+        #[test]
+        fn auto_waits_for_headroom_before_raising_quality() {
+            let settings = VideoSettings::default();
+            let nominal = Format {
+                height: 720,
+                fps: 24,
+            };
+            assert_eq!(adaptive_format(settings, nominal, 110.0, false), nominal);
+            assert_eq!(
+                adaptive_format(settings, nominal, 110.0, true),
+                Format {
+                    height: 1080,
+                    ..nominal
+                }
+            );
+            assert_eq!(
+                adaptive_format(settings, nominal, 40.0, true),
+                Format { fps: 30, ..nominal }
+            );
+        }
+
+        #[test]
+        fn settings_apply_to_a_static_source_without_restarting_capture() {
+            let state = Arc::new(State::new(VideoSettings {
+                resolution: Resolution::P720,
+                frame_rate: FrameRate::Fps15,
+            }));
+            let capture = Capture {
+                state: state.clone(),
+            };
+            let frames = Arc::new(LatestFrame::default());
+            let receiver = frames.clone();
+            let (published, publication) = std::sync::mpsc::channel();
+            let worker = thread::spawn(move || {
+                publish_frames(&receiver, &state, &|| true, |jpeg| {
+                    published.send(jpeg).unwrap();
+                })
+            });
+            frames.put(CapturedFrame {
+                image: RgbaImage::from_pixel(1280, 720, image::Rgba([88, 34, 130, 255])),
+                read_time: Duration::ZERO,
+            });
+            let first = publication.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert_eq!(image::load_from_memory(&first).unwrap().height(), 720);
+
+            capture.set_settings(VideoSettings {
+                resolution: Resolution::P480,
+                frame_rate: FrameRate::Fps60,
+            });
+            assert_eq!(capture.format(), (480, 60));
+            let second = publication.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert_eq!(image::load_from_memory(&second).unwrap().height(), 480);
+
+            drop(capture);
+            worker.join().unwrap().unwrap();
+            drop(frames);
+        }
+
+        #[test]
+        fn slow_encoder_receives_latest_frame() {
+            let frames = LatestFrame::default();
+            for value in [1, 2, 3] {
+                frames.put(CapturedFrame {
+                    image: RgbaImage::from_pixel(1, 1, image::Rgba([value, 0, 0, 255])),
+                    read_time: Duration::ZERO,
+                });
+            }
+            assert_eq!(
+                frames.take(Duration::ZERO).unwrap().image.get_pixel(0, 0)[0],
+                3
+            );
+            assert!(frames.take(Duration::ZERO).is_none());
+        }
+
+        #[test]
+        fn current_pacing_changes_as_soon_as_fps_changes() {
+            let start = Instant::now();
+            let mut pace = FramePacer::default();
+            assert!(pace.permits(start, 15));
+            assert!(!pace.permits(start + Duration::from_millis(20), 15));
+            assert!(pace.permits(start + Duration::from_millis(20), 60));
+            assert!(pace.permits(start + Duration::from_millis(37), 60));
         }
 
         #[test]
@@ -276,7 +684,6 @@ mod native {
 
     #[cfg(target_os = "windows")]
     mod platform {
-        use std::sync::mpsc::SyncSender;
 
         use windows_capture::capture::{Context, GraphicsCaptureApiHandler};
         use windows_capture::frame::Frame as NativeFrame;
@@ -339,9 +746,8 @@ mod native {
 
         pub(super) fn capture(
             source: &Source,
-            quality: Quality,
             state: &Arc<State>,
-            frames: SyncSender<RgbaImage>,
+            frames: Arc<LatestFrame>,
             consume: impl FnOnce(&dyn Fn() -> bool) -> Result<(), String>,
         ) -> Result<(), String> {
             match source.kind {
@@ -351,7 +757,7 @@ mod native {
                         .into_iter()
                         .find(|display| display_id(display) == source.id)
                         .ok_or_else(|| SOURCE_GONE.to_owned())?;
-                    stream(monitor, state, quality, frames, consume)
+                    stream(monitor, state, frames, consume)
                 }
                 SourceKind::Window => {
                     let window = Window::enumerate()
@@ -359,7 +765,7 @@ mod native {
                         .into_iter()
                         .find(|window| window_source(window).as_ref() == Some(source))
                         .ok_or_else(|| SOURCE_GONE.to_owned())?;
-                    stream(window, state, quality, frames, consume)
+                    stream(window, state, frames, consume)
                 }
             }
         }
@@ -367,8 +773,7 @@ mod native {
         fn stream<T: TryInto<GraphicsCaptureItemType> + Send + 'static>(
             item: T,
             state: &Arc<State>,
-            quality: Quality,
-            frames: SyncSender<RgbaImage>,
+            frames: Arc<LatestFrame>,
             consume: impl FnOnce(&dyn Fn() -> bool) -> Result<(), String>,
         ) -> Result<(), String> {
             let settings = Settings::new(
@@ -379,7 +784,7 @@ mod native {
                 MinimumUpdateIntervalSettings::Default,
                 DirtyRegionSettings::Default,
                 ColorFormat::Rgba8,
-                (state.clone(), frames, quality),
+                (state.clone(), frames),
             );
             if !state.active() {
                 return Ok(());
@@ -393,22 +798,20 @@ mod native {
 
         struct Handler {
             state: Arc<State>,
-            frames: SyncSender<RgbaImage>,
-            interval: Duration,
-            next_frame: Instant,
+            frames: Arc<LatestFrame>,
+            pacing: FramePacer,
         }
 
         impl GraphicsCaptureApiHandler for Handler {
-            type Flags = (Arc<State>, SyncSender<RgbaImage>, Quality);
+            type Flags = (Arc<State>, Arc<LatestFrame>);
             type Error = String;
 
             fn new(context: Context<Self::Flags>) -> Result<Self, Self::Error> {
-                let (state, frames, quality) = context.flags;
+                let (state, frames) = context.flags;
                 Ok(Self {
                     state,
                     frames,
-                    interval: Duration::from_secs_f64(1.0 / f64::from(quality.fps())),
-                    next_frame: Instant::now(),
+                    pacing: FramePacer::default(),
                 })
             }
 
@@ -418,10 +821,9 @@ mod native {
                 _control: InternalCaptureControl,
             ) -> Result<(), Self::Error> {
                 let now = Instant::now();
-                if !self.state.active() || now + Duration::from_millis(1) < self.next_frame {
+                if !self.state.active() || !self.pacing.permits(now, self.state.format().fps) {
                     return Ok(());
                 }
-                self.next_frame = (self.next_frame + self.interval).max(now);
 
                 match frame.buffer() {
                     Ok(mut buffer) => {
@@ -430,7 +832,10 @@ mod native {
                         if let Some(image) =
                             pack_rows(width, height, pitch as usize, buffer.as_raw_buffer(), false)
                         {
-                            let _ = self.frames.try_send(image);
+                            self.frames.put(CapturedFrame {
+                                image,
+                                read_time: now.elapsed(),
+                            });
                         }
                     }
                     Err(error) => self
@@ -450,7 +855,6 @@ mod native {
 
     #[cfg(target_os = "macos")]
     mod platform {
-        use std::sync::mpsc::SyncSender;
 
         use screencapturekit::cv::CVPixelBufferLockFlags;
         use screencapturekit::prelude::*;
@@ -513,9 +917,8 @@ mod native {
 
         pub(super) fn capture(
             source: &Source,
-            quality: Quality,
             state: &Arc<State>,
-            frames: SyncSender<RgbaImage>,
+            frames: Arc<LatestFrame>,
             consume: impl FnOnce(&dyn Fn() -> bool) -> Result<(), String>,
         ) -> Result<(), String> {
             let content = shareable_content()?;
@@ -549,11 +952,12 @@ mod native {
             };
             let filter =
                 filter.map_err(|error| format!("Couldn't select the capture source: {error}"))?;
-            let (width, height) = output_size(width, height, quality);
+            // Keep the native session at the supported ceiling, so either setting can change live.
+            let (width, height) = output_size(width, height, Resolution::P1080.initial_height());
             let config = SCStreamConfiguration::new()
                 .with_width(width)
                 .with_height(height)
-                .with_fps(quality.fps())
+                .with_fps(FrameRate::Fps60.initial_fps())
                 .with_queue_depth(3)
                 .with_shows_cursor(true)
                 .with_pixel_format(PixelFormat::BGRA);
@@ -564,14 +968,26 @@ mod native {
             let mut stream = SCStream::new_with_delegate(&filter, &config, errors)
                 .map_err(|error| format!("Couldn't prepare ScreenCaptureKit: {error}"))?;
             let frame_state = state.clone();
+            let pacing = Mutex::new(FramePacer::default());
             stream
                 .add_output_handler(
                     move |sample: CMSampleBuffer, kind| {
+                        let now = Instant::now();
                         if kind == SCStreamOutputType::Screen
                             && frame_state.active()
+                            && sample
+                                .frame_status()
+                                .is_none_or(|status| status.has_content())
+                            && pacing
+                                .lock()
+                                .unwrap()
+                                .permits(now, frame_state.format().fps)
                             && let Some(image) = sample_image(&sample)
                         {
-                            let _ = frames.try_send(image);
+                            frames.put(CapturedFrame {
+                                image,
+                                read_time: now.elapsed(),
+                            });
                         }
                     },
                     SCStreamOutputType::Screen,
@@ -589,12 +1005,6 @@ mod native {
         }
 
         fn sample_image(sample: &CMSampleBuffer) -> Option<RgbaImage> {
-            if sample
-                .frame_status()
-                .is_some_and(|status| !status.has_content())
-            {
-                return None;
-            }
             let pixels = sample.pixel_buffer()?;
             let lock = pixels.lock(CVPixelBufferLockFlags::READ_ONLY).ok()?;
             // The BGRA buffer is packed into owned memory while it is locked for reading.
@@ -625,7 +1035,7 @@ pub struct Capture;
 impl Capture {
     pub fn start(
         _source: Source,
-        _quality: Quality,
+        _settings: VideoSettings,
         _publish: impl Fn(Arc<[u8]>) + Send + 'static,
     ) -> Result<Self, String> {
         Err("Screen sharing is available on Windows and macOS.".into())
@@ -637,5 +1047,13 @@ impl Capture {
 
     pub fn error(&self) -> Option<String> {
         None
+    }
+
+    pub fn set_settings(&self, _settings: VideoSettings) {}
+
+    pub fn set_network_fps_limit(&self, _fps_limit: Option<u32>) {}
+
+    pub fn format(&self) -> (u32, u32) {
+        VideoSettings::default().initial_format()
     }
 }

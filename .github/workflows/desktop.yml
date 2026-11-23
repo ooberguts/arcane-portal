@@ -93,4 +93,4 @@ jobs:
             dist/Arcane-Portal-macOS-Intel.zip \
             --repo "$GITHUB_REPOSITORY" --verify-tag \
             --title "Arcane Portal $GITHUB_REF_NAME" \
-            --notes 'Share a screen or window on your local network. Broadcasts appear automatically in Live Rooms. Select Watch to join. Check for future releases from Settings → Updates. Extract the ZIP for your platform. Windows runs as a portable executable. On macOS, move Arcane Portal.app to Applications. These builds are unsigned on Windows and ad-hoc signed on macOS.'
+            --notes 'Faster screen capture and video delivery, live FPS counters, optional system audio, and independent resolution and frame-rate controls you can change while live. The viewer can retry connection errors and use fullscreen. Update both devices for the faster transport and audio. Check for updates from Settings → Updates, or install the ZIP for your platform.'
