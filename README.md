@@ -24,7 +24,7 @@ The Windows executable is unsigned. The macOS apps are ad-hoc signed and have no
 
 1. Open **Settings** to set the display name people see in Live Rooms. Arcane Portal uses your computer name by default.
 2. Open **Broadcast**, choose a screen or window, pick a quality preset, and choose **Go live**. A local preview shows what the viewers receive.
-3. Copy the LAN address for anyone who needs to join manually. **Stop sharing** ends the stream for everyone.
+3. Copy the LAN address for anyone who needs to join manually. **Stop broadcast** ends the stream for everyone.
 
 Quality presets target 480p at 15 fps, 720p at 24 fps, or 1080p at 30 fps. Actual resolution depends on the source and its aspect ratio. Capture is video-only.
 

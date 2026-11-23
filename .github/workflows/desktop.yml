@@ -51,7 +51,7 @@ jobs:
         shell: bash
         run: |
           cargo fmt --all -- --check
-          cargo test --locked --target '${{ matrix.target }}'
+          cargo test --release --locked --target '${{ matrix.target }}'
       - name: Build application
         shell: bash
         run: cargo build --release --locked --target '${{ matrix.target }}'

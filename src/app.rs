@@ -558,6 +558,8 @@ impl PortalApp {
                     vec2(input_width, 35.0),
                     egui::TextEdit::singleline(&mut self.address_draft)
                         .hint_text(format!("192.168.1.20:{DEFAULT_PORT}"))
+                        .margin(Margin::symmetric(8, 5))
+                        .vertical_align(Align::Center)
                         .char_limit(32),
                 );
                 let submitted =
@@ -584,17 +586,35 @@ impl PortalApp {
             rect.min + vec2(24.0, 28.0),
             vec2((width * 0.63).max(245.0).min(width - 48.0), 190.0),
         );
-        ui.scope_builder(UiBuilder::new().max_rect(content).layout(Layout::top_down(Align::Min)), |ui| {
-            ui.set_max_width(content.width());
-            ui.label(RichText::new("Watch a live broadcast").size(33.0).strong().color(TEXT));
-            ui.add_space(5.0);
-            ui.label(RichText::new("Watch someone’s screen or share your own with people on the same local network.").size(14.0).color(QUIET));
-            ui.add_space(15.0);
-            let title = if matches!(self.session, Session::Hosting { .. }) { "Return to broadcast" } else { "Set up a broadcast" };
-            if button(ui, title, true).clicked() {
-                self.navigate(Page::Broadcast, ui.ctx());
-            }
-        });
+        let mut content_ui = ui.new_child(
+            UiBuilder::new()
+                .max_rect(content)
+                .layout(Layout::top_down(Align::Min)),
+        );
+        content_ui.set_max_width(content.width());
+        content_ui.label(
+            RichText::new("Watch a live broadcast")
+                .size(33.0)
+                .strong()
+                .color(TEXT),
+        );
+        content_ui.add_space(5.0);
+        content_ui.label(
+            RichText::new(
+                "Watch someone’s screen or share your own with people on the same local network.",
+            )
+            .size(14.0)
+            .color(QUIET),
+        );
+        content_ui.add_space(15.0);
+        let title = if matches!(self.session, Session::Hosting { .. }) {
+            "Return to broadcast"
+        } else {
+            "Set up a broadcast"
+        };
+        if button(&mut content_ui, title, true).clicked() {
+            self.navigate(Page::Broadcast, content_ui.ctx());
+        }
     }
 
     fn broadcast(&mut self, ui: &mut Ui) {
@@ -667,6 +687,8 @@ impl PortalApp {
             ui.add_sized(
                 vec2(ui.available_width().min(380.0), 34.0),
                 egui::TextEdit::singleline(&mut self.title_draft)
+                    .margin(Margin::symmetric(8, 5))
+                    .vertical_align(Align::Center)
                     .hint_text("Screen share")
                     .char_limit(120),
             );
@@ -745,7 +767,10 @@ impl PortalApp {
             ui.label(RichText::new("Display name").strong());
             let input = ui.add_sized(
                 vec2(ui.available_width(), 36.0),
-                egui::TextEdit::singleline(&mut self.name_draft).char_limit(120),
+                egui::TextEdit::singleline(&mut self.name_draft)
+                    .margin(Margin::symmetric(8, 5))
+                    .vertical_align(Align::Center)
+                    .char_limit(120),
             );
             let submitted =
                 input.lost_focus() && ui.input(|state| state.key_pressed(egui::Key::Enter));
