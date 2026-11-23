@@ -5,7 +5,9 @@
 
 mod app;
 mod capture;
+mod install;
 mod network;
+mod update;
 
 pub(crate) struct Frame {
     pub width: u32,
@@ -14,6 +16,10 @@ pub(crate) struct Frame {
 }
 
 fn main() -> eframe::Result {
+    if let Some(code) = install::helper_exit_code() {
+        std::process::exit(code);
+    }
+
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/arcane-portal.png"))
         .expect("load the Arcane Portal icon");
     let viewport = eframe::egui::ViewportBuilder::default()
@@ -30,6 +36,10 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Arcane Portal",
         options,
-        Box::new(|context| Ok(Box::new(app::PortalApp::new(context)))),
+        Box::new(|context| {
+            let app = app::PortalApp::new(context);
+            install::confirm_relaunch();
+            Ok(Box::new(app))
+        }),
     )
 }

@@ -1,6 +1,7 @@
 use crate::Frame;
 use crate::capture::{self, Capture, Quality, Source, SourceKind};
 use crate::network::{Discovery, Host, Room, Viewer};
+use crate::update::{CURRENT_VERSION, RELEASES_URL, UpdateStatus, Updater};
 use eframe::egui::{
     self, Align, Color32, FontId, Layout, Margin, Painter, Pos2, Rect, Response, RichText, Sense,
     Shape, Stroke, StrokeKind, TextureHandle, Ui, UiBuilder, Vec2, pos2, vec2,
@@ -115,6 +116,7 @@ pub struct PortalApp {
     texture: Option<(Arc<Frame>, TextureHandle)>,
     fullscreen: bool,
     notice: Option<(String, bool)>,
+    updater: Updater,
 }
 
 impl PortalApp {
@@ -126,8 +128,15 @@ impl PortalApp {
             .and_then(|json| serde_json::from_str(&json).ok())
             .filter(|preferences: &Preferences| !preferences.name.trim().is_empty())
             .unwrap_or_default();
+        let mut updater = Updater::default();
+        let page = if let Some(error) = crate::install::previous_error() {
+            updater.report_failure(error);
+            Page::Settings
+        } else {
+            Page::Rooms
+        };
         let mut app = Self {
-            page: Page::Rooms,
+            page,
             name_draft: preferences.name.clone(),
             preferences,
             title_draft: String::new(),
@@ -142,6 +151,7 @@ impl PortalApp {
             texture: None,
             fullscreen: false,
             notice: None,
+            updater,
         };
         app.refresh_discovery();
         app
@@ -751,6 +761,8 @@ impl PortalApp {
             });
         });
         ui.add_space(22.0);
+        self.updates(ui);
+        ui.add_space(22.0);
         heading(ui, "Network", 17.0);
         ui.label(
             RichText::new(
@@ -758,6 +770,110 @@ impl PortalApp {
             )
             .color(QUIET),
         );
+    }
+
+    fn updates(&mut self, ui: &mut Ui) {
+        heading(ui, "Updates", 17.0);
+        ui.add_space(5.0);
+        card().show(ui, |ui| {
+            ui.set_width(ui.available_width().min(530.0));
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Installed version").strong());
+                ui.label(RichText::new(CURRENT_VERSION).monospace().color(ACCENT));
+            });
+            ui.add_space(6.0);
+            match self.updater.status() {
+                UpdateStatus::Idle => {
+                    ui.label(RichText::new("Check GitHub for a new release.").color(QUIET));
+                    ui.add_space(6.0);
+                    self.update_links(ui, "Check for updates");
+                }
+                UpdateStatus::Checking => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new("Checking GitHub…").color(QUIET));
+                    });
+                }
+                UpdateStatus::UpToDate => {
+                    ui.label(RichText::new("You’re up to date.").color(GREEN));
+                    ui.add_space(6.0);
+                    self.update_links(ui, "Check again");
+                }
+                UpdateStatus::Available { version } => {
+                    ui.label(
+                        RichText::new(format!("Version {version} is available.")).color(GREEN),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if button(ui, "Download update", true).clicked() {
+                            self.updater.download();
+                        }
+                        ui.hyperlink_to("View releases on GitHub", RELEASES_URL);
+                    });
+                }
+                UpdateStatus::Downloading => {
+                    if let Some((received, total)) =
+                        self.updater.progress().filter(|(_, total)| *total > 0)
+                    {
+                        let fraction = (received as f32 / total as f32).clamp(0.0, 1.0);
+                        let status = if received >= total {
+                            "Preparing update…"
+                        } else {
+                            "Downloading update…"
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(status).color(QUIET));
+                            ui.label(
+                                RichText::new(format!("{:.0}%", fraction * 100.0)).monospace(),
+                            );
+                        });
+                        ui.add(egui::ProgressBar::new(fraction).fill(ACCENT));
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                RichText::new("Downloading and preparing update…").color(QUIET),
+                            );
+                        });
+                    }
+                }
+                UpdateStatus::Ready { version } => {
+                    ui.label(
+                        RichText::new(format!("Version {version} is ready to install."))
+                            .color(GREEN),
+                    );
+                    let session_active = self.session.active();
+                    let message = if session_active {
+                        "Stop your broadcast or leave the current room before installing."
+                    } else {
+                        "Arcane Portal will close and reopen to finish the update."
+                    };
+                    ui.label(RichText::new(message).color(QUIET));
+                    ui.add_space(6.0);
+                    let install = ui.add_enabled_ui(!session_active, |ui| {
+                        button(ui, "Install and restart", true)
+                    });
+                    if install.inner.clicked() {
+                        self.updater.launch();
+                    }
+                }
+                UpdateStatus::Failed(error) => {
+                    ui.label(RichText::new(error).color(RED));
+                    ui.add_space(6.0);
+                    self.update_links(ui, "Check again");
+                }
+                UpdateStatus::Launching | UpdateStatus::Restarting => {}
+            }
+        });
+    }
+
+    fn update_links(&mut self, ui: &mut Ui, check_label: &str) {
+        ui.horizontal_wrapped(|ui| {
+            if button(ui, check_label, false).clicked() {
+                self.updater.check();
+            }
+            ui.hyperlink_to("View releases on GitHub", RELEASES_URL);
+        });
     }
 
     fn hosting(&mut self, ui: &mut Ui) {
@@ -909,11 +1025,38 @@ impl eframe::App for PortalApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.update_sources();
         self.update_session(ctx);
+        self.updater.poll();
         ctx.request_repaint_after(if self.session.active() {
             Duration::from_millis(16)
+        } else if matches!(
+            self.updater.status(),
+            UpdateStatus::Checking | UpdateStatus::Downloading | UpdateStatus::Launching
+        ) {
+            Duration::from_millis(80)
         } else {
             Duration::from_millis(300)
         });
+        if matches!(
+            self.updater.status(),
+            UpdateStatus::Launching | UpdateStatus::Restarting
+        ) {
+            if matches!(self.updater.status(), UpdateStatus::Restarting) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(BACKGROUND))
+                .show(ctx, |ui| {
+                    ui.add_space(ui.available_height() * 0.38);
+                    ui.vertical_centered(|ui| {
+                        ui.spinner();
+                        heading(ui, "Installing update", 24.0);
+                        ui.label(
+                            RichText::new("Arcane Portal will close and reopen.").color(QUIET),
+                        );
+                    });
+                });
+            return;
+        }
         if self.fullscreen {
             self.immersive(ctx);
             return;
@@ -975,6 +1118,7 @@ fn configure_style(ctx: &egui::Context) {
     style.visuals.panel_fill = BACKGROUND;
     style.visuals.window_fill = SURFACE;
     style.visuals.extreme_bg_color = FIELD;
+    style.visuals.hyperlink_color = ACCENT;
     style.visuals.selection.bg_fill = ACCENT_DARK;
     style.visuals.selection.stroke = Stroke::new(1.0_f32, ACCENT);
     style.visuals.widgets.inactive.bg_fill = SURFACE;

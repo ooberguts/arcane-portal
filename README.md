@@ -14,6 +14,10 @@ Download the ZIP for your computer from [GitHub Releases](https://github.com/oob
 
 The Windows executable is unsigned. The macOS apps are ad-hoc signed and have no Apple notarization. macOS may ask for Local Network access. To share from a Mac, allow Arcane Portal in **System Settings → Privacy & Security → Screen & System Audio Recording** (called **Screen Recording** on older macOS versions), then reopen the app if prompted. On Windows, allow the app through the firewall for **private networks** if other devices cannot connect.
 
+## Update the app
+
+In **Settings → Updates**, check GitHub for a newer release. If an update is available, download it, then choose **Install and restart**. Arcane Portal verifies the package against the SHA-256 digest from GitHub before it installs. Extract the Windows app before using the updater, or move the macOS app to a writable Applications folder.
+
 ## Watch a broadcast
 
 1. Open Arcane Portal on computers on the same local network.
@@ -30,7 +34,7 @@ Quality presets target 480p at 15 fps, 720p at 24 fps, or 1080p at 30 fps. Actua
 
 ## Network behavior
 
-Rooms are open to Arcane Portal clients on a directly connected private IPv4 subnet. Stream traffic is unencrypted, so use it on a trusted network. The app uses mDNS discovery (UDP 5353) and a direct TCP connection, normally on port 48742. Arcane Portal runs without accounts, cloud services, or internet relays.
+Rooms are open to Arcane Portal clients on a directly connected private IPv4 subnet. Stream traffic is unencrypted, so use it on a trusted network. The app uses mDNS discovery (UDP 5353) and a direct TCP connection, normally on port 48742. Sharing and watching work offline. Update checks and downloads use GitHub.
 
 ## Build from source
 
