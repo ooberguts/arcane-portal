@@ -47,6 +47,26 @@ jobs:
         run: |
           xcodebuild -version
           xcrun --sdk macosx --show-sdk-version
+      - name: Set up Windows codec assembler
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = '2.16.03'
+          $zip = Join-Path $env:RUNNER_TEMP "nasm-$version.zip"
+          $path = Join-Path $env:RUNNER_TEMP 'arcane-nasm'
+          try {
+            Invoke-WebRequest "https://www.nasm.us/pub/nasm/releasebuilds/$version/win64/nasm-$version-win64.zip" -OutFile $zip -TimeoutSec 30
+          } catch {
+            Invoke-WebRequest "https://www.nasm.dev/pub/nasm/releasebuilds/$version/win64/nasm-$version-win64.zip" -OutFile $zip -TimeoutSec 30
+          }
+          if ((Get-FileHash $zip).Hash -ne '3EE4782247BCB874378D02F7EAB4E294A84D3D15F3F6EE2DE2F47A46AA7226E6') {
+            throw 'The portable NASM archive failed checksum verification.'
+          }
+          Expand-Archive $zip $path
+          Join-Path $path "nasm-$version" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Set up Intel Mac codec assembler
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: command -v nasm || brew install nasm
       - name: Check formatting and run tests
         shell: bash
         run: |
@@ -93,4 +113,4 @@ jobs:
             dist/Arcane-Portal-macOS-Intel.zip \
             --repo "$GITHUB_REPOSITORY" --verify-tag \
             --title "Arcane Portal $GITHUB_REF_NAME" \
-            --notes 'Faster screen capture and video delivery, live FPS counters, optional system audio, and independent resolution and frame-rate controls you can change while live. The viewer can retry connection errors and use fullscreen. Update both devices for the faster transport and audio. Check for updates from Settings → Updates, or install the ZIP for your platform.'
+            --notes 'Smoother LAN viewing with H.264 video, a short playback buffer, and automatic bitrate reduction when a viewer falls behind. Update both devices to use the new video path. Check for updates from Settings → Updates, or install the ZIP for your platform. On macOS, move Arcane Portal.app into Applications using Finder before opening it.'

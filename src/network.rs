@@ -18,21 +18,26 @@ use zune_jpeg::JpegDecoder;
 
 use crate::Frame;
 use crate::audio::PACKET_BYTES;
+use crate::video::{self, Feedback, Packet, Playout};
 
 const DEFAULT_PORT: u16 = 48742;
 const SERVICE_TYPE: &str = "_arcane-portal._tcp.local.";
 const VERSION: &str = "1";
 const MAGIC: [u8; 8] = *b"APLAN01\n";
 const FAST_MAGIC: [u8; 8] = *b"APLAN02\n";
+const MOTION_MAGIC: [u8; 8] = *b"APLAN03\n";
 const AUDIO_MAGIC: [u8; 8] = *b"APAUD01\n";
 const FRAME_REQUEST: [u8; 1] = [1];
 const VIDEO_CREDITS: usize = 2;
+const MOTION_CREDITS: usize = 3;
+const MAX_MOTION_FRAMES: usize = 18;
+const MOTION_DEADLINE: Duration = Duration::from_millis(250);
 const AUDIO_BUFFER: usize = 6;
 const AUDIO_FRESHNESS: Duration = Duration::from_millis(200);
 const FPS_WINDOW: Duration = Duration::from_secs(1);
 const MAX_TEXT_BYTES: usize = 120;
 const MAX_METADATA_BYTES: usize = 2_048;
-const MAX_JPEG_BYTES: usize = 8 * 1024 * 1024;
+const MAX_VIDEO_BYTES: usize = 8 * 1024 * 1024;
 const MAX_VIEWERS: usize = 8;
 const MAX_ROOMS: usize = 128;
 const MAX_ROOM_ADDRESSES: usize = 8;
@@ -48,6 +53,7 @@ pub struct Room {
     alternatives: Vec<SocketAddrV4>,
     service_id: Option<String>,
     fast_video: bool,
+    motion_video: bool,
     pub name: String,
     pub title: String,
     pub height: u32,
@@ -93,6 +99,7 @@ impl RoomDetails {
             alternatives: Vec::new(),
             service_id: None,
             fast_video: false,
+            motion_video: false,
             name: self.name,
             title: self.title,
             height: self.height,
@@ -218,6 +225,7 @@ fn discovered_room(service: &ResolvedService, interfaces: &[Interface]) -> Optio
     room.alternatives = endpoints.collect();
     room.service_id = Some(service.get_fullname().to_owned());
     room.fast_video = service.get_property_val_str("video") == Some("2");
+    room.motion_video = service.get_property_val_str("codec") == Some("h264");
     Some(room)
 }
 
@@ -319,6 +327,10 @@ impl Host {
                 details,
                 stopped: false,
                 latest: None,
+                motion: VecDeque::new(),
+                motion_sequence: 0,
+                keyframe_requested: false,
+                last_congestion: None,
                 clients: HashMap::new(),
                 next_client: 0,
                 viewers: 0,
@@ -346,10 +358,11 @@ impl Host {
         })
     }
 
-    pub fn publisher(&self) -> impl Fn(Arc<[u8]>) + Send + 'static + use<> {
+    #[cfg(test)]
+    fn publisher(&self) -> impl Fn(Arc<[u8]>) + Send + 'static + use<> {
         let state = Arc::clone(&self.state);
         move |jpeg| {
-            if jpeg.is_empty() || jpeg.len() > MAX_JPEG_BYTES {
+            if jpeg.is_empty() || jpeg.len() > MAX_VIDEO_BYTES {
                 return;
             }
             let mut data = state.data.lock().unwrap();
@@ -360,6 +373,10 @@ impl Host {
                 state.ready.notify_all();
             }
         }
+    }
+
+    pub fn video_publisher(&self) -> VideoPublisher {
+        VideoPublisher(Arc::clone(&self.state))
     }
 
     pub fn viewers(&self) -> usize {
@@ -421,6 +438,9 @@ impl Host {
             .clients
             .values()
             .filter_map(|connection| {
+                if connection.channel != Some(Channel::LegacyVideo) {
+                    return None;
+                }
                 let delivery = connection.delivery.as_ref()?;
                 (delivery.samples >= 3 && delivery.updated.elapsed() <= IO_TIMEOUT)
                     .then_some(delivery.average / u32::from(delivery.credits))
@@ -479,10 +499,74 @@ struct HostState {
     audio_ready: Condvar,
 }
 
+pub(crate) struct VideoPublisher(Arc<HostState>);
+
+impl VideoPublisher {
+    pub fn feedback(&self) -> Feedback {
+        let data = self.0.data.lock().unwrap();
+        Feedback {
+            keyframe: data.keyframe_requested,
+            congested: data
+                .last_congestion
+                .is_some_and(|at| at.elapsed() < Duration::from_millis(1100)),
+            legacy_viewers: data
+                .clients
+                .values()
+                .any(|client| client.channel == Some(Channel::LegacyVideo)),
+        }
+    }
+
+    pub fn publish(&self, motion: Option<Packet>, legacy: Option<Arc<[u8]>>) {
+        let mut data = self.0.data.lock().unwrap();
+        if data.stopped {
+            return;
+        }
+        if let Some(packet) = motion
+            .filter(|packet| !packet.bytes.is_empty() && packet.bytes.len() <= MAX_VIDEO_BYTES)
+        {
+            data.motion_sequence += 1;
+            let sequence = data.motion_sequence;
+            if packet.keyframe {
+                data.keyframe_requested = false;
+            }
+            while data.motion.len() >= MAX_MOTION_FRAMES
+                || data
+                    .motion
+                    .front()
+                    .is_some_and(|frame| frame.published.elapsed() > MOTION_DEADLINE)
+            {
+                data.motion.pop_front();
+            }
+            data.motion.push_back(MotionFrame {
+                sequence,
+                packet,
+                published: Instant::now(),
+            });
+            data.fps.record();
+        }
+        if let Some(jpeg) = legacy.filter(|jpeg| !jpeg.is_empty() && jpeg.len() <= MAX_VIDEO_BYTES)
+        {
+            let sequence = data.latest.as_ref().map_or(1, |(sequence, _)| sequence + 1);
+            data.latest = Some((sequence, jpeg));
+        }
+        self.0.ready.notify_all();
+    }
+}
+
+struct MotionFrame {
+    sequence: u64,
+    packet: Packet,
+    published: Instant,
+}
+
 struct HostData {
     details: RoomDetails,
     stopped: bool,
     latest: Option<(u64, Arc<[u8]>)>,
+    motion: VecDeque<MotionFrame>,
+    motion_sequence: u64,
+    keyframe_requested: bool,
+    last_congestion: Option<Instant>,
     clients: HashMap<u64, Connection>,
     next_client: u64,
     viewers: usize,
@@ -542,6 +626,7 @@ struct Delivery {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Channel {
     Video,
+    LegacyVideo,
     Audio,
 }
 
@@ -558,8 +643,13 @@ fn run_host(
             let data = state.data.lock().unwrap();
             (
                 data.stopped,
-                data.latest.is_some(),
-                (data.viewers, data.details.height, data.details.fps),
+                data.latest.is_some() || !data.motion.is_empty(),
+                (
+                    data.viewers,
+                    data.details.height,
+                    data.details.fps,
+                    !data.motion.is_empty(),
+                ),
             )
         };
         if stopped {
@@ -595,8 +685,11 @@ fn run_host(
             if let Some(advertisement) = &advertisement {
                 let details = state.data.lock().unwrap().details.clone();
                 let viewers = announcement.0;
-                if advertisement.publish(&details, viewers).is_ok() {
-                    announced = Some((viewers, details.height, details.fps));
+                if advertisement
+                    .publish(&details, viewers, announcement.3)
+                    .is_ok()
+                {
+                    announced = Some((viewers, details.height, details.fps, announcement.3));
                 }
             }
         }
@@ -646,7 +739,12 @@ impl Advertisement {
         })
     }
 
-    fn publish(&self, details: &RoomDetails, viewers: usize) -> Result<(), mdns_sd::Error> {
+    fn publish(
+        &self,
+        details: &RoomDetails,
+        viewers: usize,
+        motion: bool,
+    ) -> Result<(), mdns_sd::Error> {
         let properties = [
             ("v", VERSION.to_owned()),
             ("name", details.name.clone()),
@@ -655,6 +753,7 @@ impl Advertisement {
             ("fps", details.fps.to_string()),
             ("viewers", viewers.to_string()),
             ("video", "2".to_owned()),
+            ("codec", if motion { "h264" } else { "jpeg" }.to_owned()),
         ];
         let mut service = ServiceInfo::new(
             SERVICE_TYPE,
@@ -693,7 +792,11 @@ impl Client {
         if data
             .clients
             .values()
-            .filter(|client| client.channel == Some(channel))
+            .filter(|client| {
+                client.channel.is_some_and(|existing| {
+                    (existing == Channel::Audio) == (channel == Channel::Audio)
+                })
+            })
             .count()
             >= MAX_VIEWERS
         {
@@ -784,6 +887,7 @@ fn stream_frames(
     let credits = match magic {
         MAGIC => 1,
         FAST_MAGIC => VIDEO_CREDITS,
+        MOTION_MAGIC => MOTION_CREDITS,
         AUDIO_MAGIC => {
             client.reserve_channel(Channel::Audio)?;
             write_handshake(&mut socket, &magic, details)?;
@@ -795,7 +899,12 @@ fn stream_frames(
             ));
         }
     };
-    client.reserve_channel(Channel::Video)?;
+    let motion = magic == MOTION_MAGIC;
+    client.reserve_channel(if motion {
+        Channel::Video
+    } else {
+        Channel::LegacyVideo
+    })?;
     write_handshake(&mut socket, &magic, details)?;
     socket.set_read_timeout(Some(IO_TIMEOUT))?;
     socket.set_write_timeout(Some(IO_TIMEOUT))?;
@@ -809,13 +918,25 @@ fn stream_frames(
         if request != FRAME_REQUEST {
             return Err(invalid_data("Unexpected frame request"));
         }
-        if sent_at.len() == credits
+        if !motion
+            && sent_at.len() == credits
             && let Some(acknowledged) = sent_at.pop_front()
         {
             // Each replenished credit acknowledges the earliest outstanding JPEG.
             client.record_delivery(acknowledged, credits as u8);
         }
-        let (sequence, jpeg, viewers) = wait_for_frame(&client.host, previous)?;
+        let (sequence, bytes, viewers, motion_header) = if motion {
+            let (sequence, packet, viewers, reset) = wait_for_motion(&client.host, previous)?;
+            (
+                sequence,
+                packet.bytes,
+                viewers,
+                Some((packet.timestamp_ms, reset)),
+            )
+        } else {
+            let (sequence, jpeg, viewers) = wait_for_frame(&client.host, previous)?;
+            (sequence, jpeg, viewers, None)
+        };
         let viewers = if client.watching {
             viewers
         } else {
@@ -824,13 +945,67 @@ fn stream_frames(
             client.watching = true;
             data.viewers
         };
-        let mut header = [0; 5];
-        header[..4].copy_from_slice(&(jpeg.len() as u32).to_be_bytes());
+        let mut header = [0; 14];
+        header[..4].copy_from_slice(&(bytes.len() as u32).to_be_bytes());
         header[4] = viewers as u8;
-        sent_at.push_back(Instant::now());
-        socket.write_all(&header)?;
-        socket.write_all(&jpeg)?;
+        let header_len = if let Some((timestamp, reset)) = motion_header {
+            header[5..13].copy_from_slice(&timestamp.to_be_bytes());
+            header[13] = u8::from(reset);
+            header.len()
+        } else {
+            5
+        };
+        if !motion {
+            sent_at.push_back(Instant::now());
+        }
+        socket.write_all(&header[..header_len])?;
+        socket.write_all(&bytes)?;
         previous = sequence;
+    }
+}
+
+fn wait_for_motion(host: &HostState, previous: u64) -> io::Result<(u64, Packet, usize, bool)> {
+    let deadline = Instant::now() + FRAME_TIMEOUT;
+    let mut data = host.data.lock().unwrap();
+    let mut resuming = previous == 0;
+    loop {
+        if data.stopped {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "Broadcast stopped",
+            ));
+        }
+        if !resuming && let Some(next) = data.motion.iter().find(|frame| frame.sequence > previous)
+        {
+            if next.sequence == previous + 1 && next.published.elapsed() <= MOTION_DEADLINE {
+                return Ok((next.sequence, next.packet.clone(), data.viewers, false));
+            }
+            resuming = true;
+            data.last_congestion = Some(Instant::now());
+        }
+        if resuming {
+            if let Some(keyframe) = data.motion.iter().rev().find(|frame| {
+                frame.sequence > previous
+                    && frame.packet.keyframe
+                    && frame.published.elapsed() <= MOTION_DEADLINE
+            }) {
+                return Ok((
+                    keyframe.sequence,
+                    keyframe.packet.clone(),
+                    data.viewers,
+                    true,
+                ));
+            }
+            data.keyframe_requested = true;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "No recent video frame arrived",
+            ));
+        }
+        (data, _) = host.ready.wait_timeout(data, remaining).unwrap();
     }
 }
 
@@ -923,6 +1098,8 @@ struct ViewerState {
     socket: Option<TcpStream>,
     audio_socket: Option<TcpStream>,
     frame: Option<Arc<Frame>>,
+    playout: Playout,
+    decoded_video: bool,
     room: Option<Room>,
     error: Option<String>,
     fps: FrameRate,
@@ -937,6 +1114,7 @@ struct JoinPlan {
     identity: Option<(String, String)>,
     service_id: Option<String>,
     fast_video: bool,
+    motion_video: bool,
 }
 
 impl JoinPlan {
@@ -960,12 +1138,13 @@ impl Viewer {
             Some(identity),
             room.service_id.clone(),
             room.fast_video,
+            room.motion_video,
         )
     }
 
     #[cfg(test)]
     fn connect(address: SocketAddrV4) -> Result<Self, String> {
-        Self::start(vec![address], None, None, false)
+        Self::start(vec![address], None, None, false, false)
     }
 
     fn start(
@@ -973,6 +1152,7 @@ impl Viewer {
         identity: Option<(String, String)>,
         service_id: Option<String>,
         fast_video: bool,
+        motion_video: bool,
     ) -> Result<Self, String> {
         let interfaces = lan_interfaces();
         candidates.retain(|address| {
@@ -993,6 +1173,7 @@ impl Viewer {
             identity,
             service_id,
             fast_video,
+            motion_video,
         };
         thread::Builder::new()
             .name("arcane-viewer".into())
@@ -1002,7 +1183,11 @@ impl Viewer {
     }
 
     pub fn frame(&self) -> Option<Arc<Frame>> {
-        self.state.lock().unwrap().frame.clone()
+        let mut state = self.state.lock().unwrap();
+        if let Some(frame) = state.playout.due(Instant::now()) {
+            state.frame = Some(frame);
+        }
+        state.frame.clone()
     }
 
     pub fn room(&self) -> Option<Room> {
@@ -1090,7 +1275,7 @@ fn finish_attempt(
     let Err(error) = result else {
         return true;
     };
-    if state.frame.is_some() {
+    if state.decoded_video {
         state.error = Some(format!(
             "The broadcast ended or the connection was lost. {error}"
         ));
@@ -1122,7 +1307,9 @@ fn receive_frames(
         }
         state.socket = Some(socket.try_clone()?);
     }
-    let (magic, credits) = if plan.fast_video {
+    let (magic, credits) = if plan.motion_video {
+        (MOTION_MAGIC, MOTION_CREDITS)
+    } else if plan.fast_video {
         (FAST_MAGIC, VIDEO_CREDITS)
     } else {
         (MAGIC, 1)
@@ -1130,27 +1317,52 @@ fn receive_frames(
     let details = negotiate(&mut socket, &magic, plan.identity.as_ref())?;
     viewer.lock().unwrap().room = Some(details.into_room(address, 0));
     socket.set_read_timeout(Some(IO_TIMEOUT))?;
-    socket.write_all(&[FRAME_REQUEST[0]; VIDEO_CREDITS][..credits])?;
+    socket.write_all(&[FRAME_REQUEST[0]; MOTION_CREDITS][..credits])?;
 
-    let mut jpeg = Vec::new();
-    let mut header = [0; 5];
+    let mut packet = Vec::new();
+    let mut header = [0; 14];
+    let header_len = if plan.motion_video { header.len() } else { 5 };
+    let mut decoder = None::<openh264::decoder::Decoder>;
     let mut first_frame = true;
     loop {
-        socket.read_exact(&mut header)?;
+        socket.read_exact(&mut header[..header_len])?;
         let length = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
-        if length == 0 || length > MAX_JPEG_BYTES {
+        if length == 0 || length > MAX_VIDEO_BYTES {
             return Err(invalid_data("Invalid screen frame size"));
         }
-        jpeg.resize(length, 0);
-        socket.read_exact(&mut jpeg)?;
-        let frame = decode_frame(&jpeg)?;
+        packet.resize(length, 0);
+        socket.read_exact(&mut packet)?;
+        let reset = plan.motion_video && header[13] != 0;
+        let frame = if plan.motion_video {
+            if reset || decoder.is_none() {
+                decoder = Some(openh264::decoder::Decoder::new().map_err(io::Error::other)?);
+            }
+            video::decode(decoder.as_mut().unwrap(), &packet).map_err(io::Error::other)?
+        } else {
+            Some(decode_frame(&packet)?)
+        };
+        let Some(frame) = frame else {
+            socket.write_all(&FRAME_REQUEST)?;
+            continue;
+        };
         let height = frame.height;
         {
             let mut state = viewer.lock().unwrap();
             if state.stopped {
                 return Ok(());
             }
-            state.frame = Some(Arc::new(frame));
+            state.decoded_video = true;
+            if plan.motion_video {
+                if reset {
+                    state.playout = Playout::default();
+                }
+                let timestamp = u64::from_be_bytes(header[5..13].try_into().unwrap());
+                state
+                    .playout
+                    .push(timestamp, Instant::now(), Arc::new(frame));
+            } else {
+                state.frame = Some(Arc::new(frame));
+            }
             state.fps.record();
             if let Some(room) = &mut state.room {
                 room.height = height;
@@ -1415,6 +1627,74 @@ mod tests {
         audio(vec![77; PACKET_BYTES].into());
         assert!(host.state.data.lock().unwrap().audio.is_empty());
         assert!(viewer.audio_error().is_none());
+    }
+
+    #[test]
+    fn modern_viewer_keeps_order_through_live_codec_changes() {
+        let details = RoomDetails::new("Host", "Motion", 720, 24).unwrap();
+        let host = Host::listen(details.clone(), 0, Vec::new()).unwrap();
+        let publish = host.video_publisher();
+        let mut codec = video::Encoder::default();
+        let now = Instant::now();
+        codec.update_picture(128, 72, &vec![95; 128 * 72 * 4]);
+        publish.publish(codec.encode(24, 0, now, &publish.feedback()).unwrap(), None);
+        let mut room = details.into_room(host.addresses()[0], 0);
+        room.motion_video = true;
+        room.fast_video = true;
+        let viewer = Viewer::join(&room).unwrap();
+        eventually(|| viewer.frame().is_some_and(|frame| frame.height == 72));
+        codec.update_picture(96, 64, &vec![184; 96 * 64 * 4]);
+        publish.publish(
+            codec
+                .encode(30, 140, Instant::now(), &publish.feedback())
+                .unwrap(),
+            None,
+        );
+        eventually(|| viewer.frame().is_some_and(|frame| frame.height == 64));
+
+        let legacy = Viewer::connect(room.address).unwrap();
+        eventually(|| publish.feedback().legacy_viewers);
+        publish.publish(None, Some(test_frame().into()));
+        eventually(|| legacy.frame().is_some());
+        assert_eq!(host.viewers(), 2);
+        assert!(viewer.error().is_none());
+    }
+
+    #[test]
+    fn lagging_motion_viewer_can_resume_only_from_a_keyframe() {
+        let details = RoomDetails::new("Host", "Motion", 720, 24).unwrap();
+        let host = Host::listen(details, 0, Vec::new()).unwrap();
+        let publish = host.video_publisher();
+        for index in 0..MAX_MOTION_FRAMES {
+            publish.publish(
+                Some(Packet {
+                    bytes: Arc::from([1u8]),
+                    timestamp_ms: index as u64,
+                    keyframe: false,
+                }),
+                None,
+            );
+        }
+        publish.publish(
+            Some(Packet {
+                bytes: Arc::from([2u8]),
+                timestamp_ms: 100,
+                keyframe: true,
+            }),
+            None,
+        );
+        publish.publish(
+            Some(Packet {
+                bytes: Arc::from([3u8]),
+                timestamp_ms: 140,
+                keyframe: false,
+            }),
+            None,
+        );
+        let (sequence, keyframe, _, reset) = wait_for_motion(&host.state, 1).unwrap();
+        assert!(reset && keyframe.keyframe && publish.feedback().congested);
+        let (_, next, _, reset) = wait_for_motion(&host.state, sequence).unwrap();
+        assert!(!reset && next.bytes.as_ref() == [3]);
     }
 
     #[test]

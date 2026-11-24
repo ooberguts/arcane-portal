@@ -36,6 +36,8 @@ Set **Resolution** and **Frame rate** independently before going live or while b
 
 Turn on **Share system audio** in **Broadcast** when you want viewers to hear sound playing on your computer. You can switch it on or off while live. Viewers can toggle playback or go fullscreen from the watch screen. Update both devices for the faster video transport and audio support.
 
+Current versions use H.264 and an 85 ms viewer playback buffer. The broadcaster can lower the video bitrate when a viewer falls behind. Older Arcane Portal viewers can still use the JPEG stream. Update both devices for smoother video.
+
 ## Network behavior
 
 Rooms are open to Arcane Portal clients on a directly connected private IPv4 subnet. Stream traffic is unencrypted, so use it on a trusted network. The app uses mDNS discovery (UDP 5353) and a direct TCP connection, normally on port 48742. If that inbound connection fails, current versions can have the broadcaster initiate a TCP connection to the viewer. Sharing and watching work offline. Update checks and downloads use GitHub.
@@ -44,7 +46,7 @@ If a room appears but cannot connect, verify that both devices are on the same t
 
 ## Build from source
 
-Install stable Rust. Use Visual Studio Build Tools with the Desktop development with C++ workload on Windows, or Xcode 26 or newer on macOS. The Mac packages target macOS 13 and later.
+Install stable Rust. Use Visual Studio Build Tools with the Desktop development with C++ workload on Windows, or Xcode 26 or newer on macOS. Add NASM to `PATH` for optimized x64 video builds. The Mac packages target macOS 13 and later.
 
 ```sh
 cargo test --locked

@@ -349,7 +349,7 @@ mod native {
         pub fn start(
             source: Source,
             settings: VideoSettings,
-            publish: impl Fn(Arc<[u8]>) + Send + 'static,
+            publisher: crate::network::VideoPublisher,
         ) -> Result<Self, String> {
             let state = Arc::new(State::new(settings));
             let capture_state = state.clone();
@@ -365,7 +365,13 @@ mod native {
                         &capture_state,
                         frames.clone(),
                         |native_running| {
-                            publish_frames(&frames, &capture_state, native_running, publish)
+                            publish_frames(
+                                &frames,
+                                &capture_state,
+                                native_running,
+                                || publisher.feedback(),
+                                |motion, jpeg| publisher.publish(motion, jpeg),
+                            )
                         },
                     );
                     if let Err(error) = result {
@@ -412,25 +418,35 @@ mod native {
         receiver: &LatestFrame,
         state: &State,
         native_running: &dyn Fn() -> bool,
-        publish: impl Fn(Arc<[u8]>),
+        feedback: impl Fn() -> crate::video::Feedback,
+        publish: impl Fn(Option<crate::video::Packet>, Option<Arc<[u8]>>),
     ) -> Result<(), String> {
         let began = Instant::now();
-        let mut last_sent = began;
+        let mut next_frame = began;
+        let mut last_legacy_sent = began;
         let mut source = None::<CapturedFrame>;
+        let mut source_changed = false;
         let mut last_height = None;
+        let mut preview = None::<Arc<Frame>>;
         let mut last_jpeg = None::<Arc<[u8]>>;
         let mut resizer = Resizer::new();
+        let mut encoder = crate::video::Encoder::default();
 
         while state.active() {
             if !native_running() {
                 return Err("The screen capture session ended.".into());
             }
-            let new_frame = if let Some(frame) = receiver.take(CAPTURE_POLL) {
-                source = Some(frame);
-                true
+            let wait = if source.is_some() {
+                next_frame
+                    .saturating_duration_since(Instant::now())
+                    .min(CAPTURE_POLL)
             } else {
-                false
+                CAPTURE_POLL
             };
+            if let Some(frame) = receiver.take(wait) {
+                source = Some(frame);
+                source_changed = true;
+            }
             let Some(source) = &source else {
                 if began.elapsed() >= FIRST_FRAME_TIMEOUT {
                     return Err("The selected source produced no frames. Make sure it is visible and try again.".into());
@@ -441,48 +457,71 @@ mod native {
                 break;
             }
             let format = state.format();
-            if !new_frame && last_height == Some(format.height) {
-                if last_sent.elapsed() >= STATIC_FRAME_INTERVAL
-                    && let Some(jpeg) = &last_jpeg
-                {
-                    publish(jpeg.clone());
-                    last_sent = Instant::now();
-                }
+            let started = Instant::now();
+            if started < next_frame && last_height == Some(format.height) {
                 continue;
             }
-
-            let started = Instant::now();
-            let image = &source.image;
-            let (width, height) = output_size(image.width(), image.height(), format.height);
-            let (jpeg, rgba) = if image.dimensions() == (width, height) {
-                (encode_frame(image, format.height)?, image.as_raw().clone())
+            let picture_changed = source_changed || last_height != Some(format.height);
+            if picture_changed {
+                let image = &source.image;
+                let (width, height) = output_size(image.width(), image.height(), format.height);
+                let (width, height) = ((width & !1).max(2), (height & !1).max(2));
+                let rgba = if image.dimensions() == (width, height) {
+                    image.as_raw().clone()
+                } else {
+                    let mut resized = RgbaImage::new(width, height);
+                    resizer
+                        .resize(image, &mut resized, &ResizeOptions::new().use_alpha(false))
+                        .map_err(|error| format!("Couldn't resize the screen frame: {error}"))?;
+                    resized.into_raw()
+                };
+                encoder.update_picture(width, height, &rgba);
+                let frame = Arc::new(Frame {
+                    width,
+                    height,
+                    rgba,
+                });
+                *state.frame.lock().unwrap() = Some(frame.clone());
+                preview = Some(frame);
+                last_height = Some(format.height);
+            }
+            let feedback = feedback();
+            let packet = encoder.encode(
+                format.fps,
+                started.duration_since(began).as_millis() as u64,
+                started,
+                &feedback,
+            )?;
+            let mut legacy = None;
+            if feedback.legacy_viewers {
+                if picture_changed || last_jpeg.is_none() {
+                    last_jpeg = Some(encode_frame(preview.as_ref().unwrap(), format.height)?);
+                }
+                if picture_changed
+                    || last_legacy_sent == began
+                    || last_legacy_sent.elapsed() >= STATIC_FRAME_INTERVAL
+                {
+                    legacy = last_jpeg.clone();
+                    last_legacy_sent = started;
+                }
             } else {
-                let mut resized = RgbaImage::new(width, height);
-                resizer
-                    .resize(image, &mut resized, &ResizeOptions::new().use_alpha(false))
-                    .map_err(|error| format!("Couldn't resize the screen frame: {error}"))?;
-                (encode_frame(&resized, format.height)?, resized.into_raw())
-            };
+                last_jpeg = None;
+                last_legacy_sent = began;
+            }
             if !state.active() {
                 break;
             }
-            let elapsed = started.elapsed() + source.read_time;
-            *state.frame.lock().unwrap() = Some(Arc::new(Frame {
-                width,
-                height,
-                rgba,
-            }));
-            publish(jpeg.clone());
-            last_jpeg = Some(jpeg);
-            last_height = Some(format.height);
-            last_sent = Instant::now();
-            if new_frame {
-                state
-                    .controls
-                    .lock()
-                    .unwrap()
-                    .record_encode(format, elapsed, last_sent);
+            publish(packet, legacy);
+            let interval = Duration::from_secs_f64(1.0 / f64::from(format.fps));
+            next_frame = (next_frame + interval).max(started + interval / 2);
+            if source_changed {
+                state.controls.lock().unwrap().record_encode(
+                    format,
+                    started.elapsed() + source.read_time,
+                    Instant::now(),
+                );
             }
+            source_changed = false;
         }
         Ok(())
     }
@@ -496,22 +535,22 @@ mod native {
         (scaled(width), scaled(height))
     }
 
-    fn encode_frame(image: &RgbaImage, height: u32) -> Result<Arc<[u8]>, String> {
+    fn encode_frame(frame: &Frame, height: u32) -> Result<Arc<[u8]>, String> {
         let compression = match height {
             480 => 65,
             720 => 74,
             _ => 80,
         };
         let mut jpeg = Vec::new();
-        let width = u16::try_from(image.width())
+        let width = u16::try_from(frame.width)
             .map_err(|_| "Screen frame is too wide to encode".to_owned())?;
-        let height = u16::try_from(image.height())
+        let height = u16::try_from(frame.height)
             .map_err(|_| "Screen frame is too tall to encode".to_owned())?;
         let mut encoder = Encoder::new(&mut jpeg, compression);
         // Preserve vertical chroma detail for small text while reducing bandwidth and CPU work.
         encoder.set_sampling_factor(SamplingFactor::F_2_1);
         encoder
-            .encode(image.as_raw(), width, height, ColorType::Rgba)
+            .encode(&frame.rgba, width, height, ColorType::Rgba)
             .map_err(|error| format!("Couldn't encode the screen frame: {error}"))?;
         Ok(jpeg.into())
     }
@@ -623,24 +662,50 @@ mod native {
             let receiver = frames.clone();
             let (published, publication) = std::sync::mpsc::channel();
             let worker = thread::spawn(move || {
-                publish_frames(&receiver, &state, &|| true, |jpeg| {
-                    published.send(jpeg).unwrap();
-                })
+                publish_frames(
+                    &receiver,
+                    &state,
+                    &|| true,
+                    crate::video::Feedback::default,
+                    |packet, _| {
+                        if let Some(packet) = packet {
+                            let _ = published.send(packet);
+                        }
+                    },
+                )
             });
             frames.put(CapturedFrame {
                 image: RgbaImage::from_pixel(1280, 720, image::Rgba([88, 34, 130, 255])),
                 read_time: Duration::ZERO,
             });
             let first = publication.recv_timeout(Duration::from_secs(3)).unwrap();
-            assert_eq!(image::load_from_memory(&first).unwrap().height(), 720);
+            assert!(first.keyframe);
+            let mut decoder = openh264::decoder::Decoder::new().unwrap();
+            assert_eq!(
+                crate::video::decode(&mut decoder, &first.bytes)
+                    .unwrap()
+                    .unwrap()
+                    .height,
+                720
+            );
 
             capture.set_settings(VideoSettings {
                 resolution: Resolution::P480,
                 frame_rate: FrameRate::Fps60,
             });
             assert_eq!(capture.format(), (480, 60));
-            let second = publication.recv_timeout(Duration::from_secs(3)).unwrap();
-            assert_eq!(image::load_from_memory(&second).unwrap().height(), 480);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let packet = publication
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .unwrap();
+                if crate::video::decode(&mut decoder, &packet.bytes)
+                    .unwrap()
+                    .is_some_and(|frame| frame.height == 480)
+                {
+                    break;
+                }
+            }
 
             drop(capture);
             worker.join().unwrap().unwrap();
@@ -1036,7 +1101,7 @@ impl Capture {
     pub fn start(
         _source: Source,
         _settings: VideoSettings,
-        _publish: impl Fn(Arc<[u8]>) + Send + 'static,
+        _publisher: crate::network::VideoPublisher,
     ) -> Result<Self, String> {
         Err("Screen sharing is available on Windows and macOS.".into())
     }

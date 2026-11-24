@@ -283,7 +283,7 @@ impl PortalApp {
         let settings = self.preferences.video;
         let (height, fps) = settings.initial_format();
         let started = Host::start(&self.preferences.name, &title, height, fps).and_then(|host| {
-            Capture::start(source, settings, host.publisher()).map(|capture| (host, capture))
+            Capture::start(source, settings, host.video_publisher()).map(|capture| (host, capture))
         });
         match started {
             Ok((host, capture)) => {
@@ -985,6 +985,10 @@ impl PortalApp {
             )
             .color(QUIET),
         );
+        ui.add_space(22.0);
+        ui.collapsing("OpenH264 license", |ui| {
+            ui.label(RichText::new(include_str!("../assets/OpenH264-LICENSE.txt")).color(QUIET));
+        });
     }
 
     fn updates(&mut self, ui: &mut Ui) {

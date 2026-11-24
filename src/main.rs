@@ -10,6 +10,7 @@ mod install;
 mod network;
 mod reverse;
 mod update;
+mod video;
 
 pub(crate) struct Frame {
     pub width: u32,
