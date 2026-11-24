@@ -9,14 +9,16 @@ Download the ZIP for your computer from [GitHub Releases](https://github.com/oob
 | Platform | Package | Setup |
 | --- | --- | --- |
 | Windows 10 version 2004 or newer, or Windows 11 (x64) | `Arcane-Portal-Windows-x64.zip` | Extract the ZIP and open `Arcane Portal.exe`. |
-| macOS 13 or newer (Apple silicon) | `Arcane-Portal-macOS-Apple-silicon.zip` | Extract the ZIP and move `Arcane Portal.app` to Applications. |
-| macOS 13 or newer (Intel) | `Arcane-Portal-macOS-Intel.zip` | Extract the ZIP and move `Arcane Portal.app` to Applications. |
+| macOS 13 or newer (Apple silicon) | `Arcane-Portal-macOS-Apple-silicon.zip` | Extract the ZIP, move `Arcane Portal.app` to Applications in Finder, then open it. |
+| macOS 13 or newer (Intel) | `Arcane-Portal-macOS-Intel.zip` | Extract the ZIP, move `Arcane Portal.app` to Applications in Finder, then open it. |
 
 The Windows executable is unsigned. The macOS apps are ad-hoc signed and have no Apple notarization. macOS may ask for Local Network access. To share from a Mac, allow Arcane Portal in **System Settings → Privacy & Security → Screen & System Audio Recording** (called **Screen Recording** on older macOS versions), then reopen the app if prompted. On Windows, allow the app through the firewall for **private networks** if other devices cannot connect.
 
 ## Update the app
 
 In **Settings → Updates**, check GitHub for a newer release. If an update is available, download it, then choose **Install and restart**. Arcane Portal verifies the package against the SHA-256 digest from GitHub before it installs. Extract the Windows app before using the updater, or move the macOS app to a writable Applications folder.
+
+On macOS, a read-only update path under `/private/var/folders/` can mean the app launched from a temporary location. Quit Arcane Portal, move the extracted `.app` into Applications with Finder, and launch it from there before retrying. A writable Applications folder in your home directory also works.
 
 ## Watch a broadcast
 

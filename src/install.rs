@@ -91,16 +91,19 @@ mod native {
         }
     }
 
-    pub(crate) fn stage(archive: File) -> Result<StagedUpdate, String> {
+    pub(crate) fn stage(
+        download: impl FnOnce() -> Result<File, String>,
+    ) -> Result<StagedUpdate, String> {
         let executable = std::env::current_exe().map_err(|error| error.to_string())?;
         let target = installed_target(&executable).map_err(|error| error.to_string())?;
         let folder = parent(&target).map_err(|error| error.to_string())?;
-        let stage = create_stage(folder).map_err(|error| {
-            format!(
-                "Couldn't prepare the update in {}. Move Arcane Portal to a folder you can write to, then reopen it. {error}",
-                folder.display()
-            )
-        })?;
+        #[cfg(target_os = "macos")]
+        if is_translocated(folder) {
+            return Err("macOS opened Arcane Portal from a temporary read-only location. Quit Arcane Portal, move Arcane Portal.app into Applications using Finder, then open the moved copy and check for updates again.".into());
+        }
+        drop(tempfile::tempfile_in(folder).map_err(|error| staging_error(folder, &error))?);
+        let archive = download()?;
+        let stage = create_stage(folder).map_err(|error| staging_error(folder, &error))?;
         let update = StagedUpdate {
             paths: Paths { stage, target },
             handed_off: false,
@@ -111,6 +114,28 @@ mod native {
             .and_then(|()| fs::copy(executable, files.helper()).map(|_| ()))
             .map_err(|error| format!("Couldn't prepare the release package: {error}"))?;
         Ok(update)
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    fn is_translocated(path: &Path) -> bool {
+        (path.starts_with("/private/var/folders") || path.starts_with("/var/folders"))
+            && path
+                .components()
+                .any(|part| part.as_os_str() == "AppTranslocation")
+    }
+
+    fn staging_error(folder: &Path, error: &io::Error) -> String {
+        #[cfg(target_os = "macos")]
+        if matches!(
+            error.kind(),
+            io::ErrorKind::ReadOnlyFilesystem | io::ErrorKind::PermissionDenied
+        ) {
+            return "Arcane Portal’s current folder won’t allow updates. Quit the app, move Arcane Portal.app into a writable Applications folder in Finder, then open the moved copy. If /Applications requires administrator access, use Applications in your home folder.".into();
+        }
+        format!(
+            "Couldn't prepare the update in {}. Move Arcane Portal to a folder you can write to, then reopen it. {error}",
+            folder.display()
+        )
     }
 
     impl StagedUpdate {
@@ -700,6 +725,28 @@ mod native {
     fn invalid_path() -> io::Error {
         io::Error::other("The current installation or update directory is invalid.")
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn recognizes_gatekeepers_temporary_mount() {
+            assert!(is_translocated(Path::new(
+                "/private/var/folders/ab/cache/T/AppTranslocation/id/d"
+            )));
+            assert!(is_translocated(Path::new(
+                "/var/folders/ab/cache/T/AppTranslocation/id/d"
+            )));
+            assert!(!is_translocated(Path::new("/Applications")));
+            assert!(!is_translocated(Path::new(
+                "/Users/test/AppTranslocation/Applications"
+            )));
+            assert!(!is_translocated(Path::new(
+                "/private/var/folders/ab/cache/T"
+            )));
+        }
+    }
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -716,7 +763,9 @@ impl StagedUpdate {
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-pub(crate) fn stage(_: std::fs::File) -> Result<StagedUpdate, String> {
+pub(crate) fn stage(
+    _: impl FnOnce() -> Result<std::fs::File, String>,
+) -> Result<StagedUpdate, String> {
     Err(unsupported())
 }
 

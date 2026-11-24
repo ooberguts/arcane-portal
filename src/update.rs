@@ -105,8 +105,7 @@ impl Updater {
         });
         self.status = UpdateStatus::Downloading;
         self.spawn(move || {
-            let archive = download_package(&release, &received)?;
-            let update = install::stage(archive)?;
+            let update = install::stage(|| download_package(&release, &received))?;
             Ok(WorkerOutput::Stage {
                 version: release.version.to_string(),
                 update,
