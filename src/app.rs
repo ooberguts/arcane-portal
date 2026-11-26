@@ -1228,7 +1228,7 @@ impl PortalApp {
             ui.label(RichText::new(message).color(QUIET));
         }
         ui.label(
-            RichText::new(format!("Received: {actual_fps:.1} fps"))
+            RichText::new(format!("Displayed: {actual_fps:.1} fps"))
                 .strong()
                 .color(ACCENT),
         );
@@ -1294,7 +1294,7 @@ impl PortalApp {
                     "Waiting for the first frame…",
                 );
                 if let Session::Watching { viewer, .. } = &self.session {
-                    let label = format!("Received: {:.1} fps", viewer.stream_fps());
+                    let label = format!("Displayed: {:.1} fps", viewer.stream_fps());
                     let position = rect.left_top() + vec2(18.0, 18.0);
                     ui.painter().rect_filled(
                         Rect::from_min_size(position - vec2(8.0, 5.0), vec2(185.0, 32.0)),
@@ -1333,7 +1333,12 @@ impl eframe::App for PortalApp {
         self.update_sources();
         self.update_session(ctx);
         self.updater.poll();
-        ctx.request_repaint_after(if self.session.active() {
+        ctx.request_repaint_after(if let Session::Watching { viewer, .. } = &self.session {
+            viewer
+                .next_frame_delay()
+                .unwrap_or(Duration::from_millis(8))
+                .clamp(Duration::from_millis(1), Duration::from_millis(8))
+        } else if self.session.active() {
             Duration::from_millis(16)
         } else if matches!(
             self.updater.status(),

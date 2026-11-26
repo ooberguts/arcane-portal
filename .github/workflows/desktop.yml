@@ -113,4 +113,4 @@ jobs:
             dist/Arcane-Portal-macOS-Intel.zip \
             --repo "$GITHUB_REPOSITORY" --verify-tag \
             --title "Arcane Portal $GITHUB_REF_NAME" \
-            --notes 'Smoother LAN viewing with H.264 video, a short playback buffer, and automatic bitrate reduction when a viewer falls behind. Update both devices to use the new video path. Check for updates from Settings → Updates, or install the ZIP for your platform. On macOS, move Arcane Portal.app into Applications using Finder before opening it.'
+            --notes 'Smoother LAN streams with steadier frame pacing, parallel H.264 encoding, and a larger playback buffer. Delivery feedback lets the broadcaster adjust bitrate while the stream is live. Auto starts at 720p and 30 FPS and prioritizes steady playback. Update both devices from Settings → Updates. On macOS, move Arcane Portal.app into Applications using Finder before opening it.'

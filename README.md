@@ -32,11 +32,11 @@ On macOS, a read-only update path under `/private/var/folders/` can mean the app
 2. Open **Broadcast**, choose a screen or window, and choose **Go live**. A local preview shows what the viewers receive.
 3. Viewers on your network can find the broadcast in **Live Rooms**. **Stop broadcast** ends the stream for everyone.
 
-Set **Resolution** and **Frame rate** independently before going live or while broadcasting. Resolution can target 480p, 720p, or 1080p. Frame rate can target 15, 24, 30, or 60 FPS. Each control has an **Auto** setting that adjusts based on capture and viewer delivery. The live FPS counters show how many frames the host sends and the viewer decodes. Resolution retains the source's aspect ratio.
+Set **Resolution** and **Frame rate** independently before going live or while broadcasting. Resolution can target 480p, 720p, or 1080p. Frame rate can target 15, 24, 30, or 60 FPS. **Auto** starts at 720p and 30 FPS and can use higher settings when the source, hardware, and link have headroom. If the bitrate reaches its minimum and the viewer is still falling behind, Auto can lower resolution before lowering frame rate. The live FPS counters show how many frames the host publishes and the viewer displays. Resolution retains the source's aspect ratio.
 
 Turn on **Share system audio** in **Broadcast** when you want viewers to hear sound playing on your computer. You can switch it on or off while live. Viewers can toggle playback or go fullscreen from the watch screen. Update both devices for the faster video transport and audio support.
 
-Current versions use H.264 and an 85 ms viewer playback buffer. The broadcaster can lower the video bitrate when a viewer falls behind. Older Arcane Portal viewers can still use the JPEG stream. Update both devices for smoother video.
+Current versions use H.264 and a 220 ms viewer playback buffer to smooth short network stalls. The viewer acknowledges each received frame so the broadcaster can adjust bitrate as delivery slows. Update both devices to get delivery feedback. Older Arcane Portal versions can still watch using their existing H.264 or JPEG stream.
 
 ## Network behavior
 

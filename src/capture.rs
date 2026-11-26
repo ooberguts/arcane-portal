@@ -56,8 +56,8 @@ impl FrameRate {
     fn initial_fps(self) -> u32 {
         match self {
             Self::Fps15 => 15,
-            Self::Auto | Self::Fps24 => 24,
-            Self::Fps30 => 30,
+            Self::Fps24 => 24,
+            Self::Auto | Self::Fps30 => 30,
             Self::Fps60 => 60,
         }
     }
@@ -98,7 +98,7 @@ mod native {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use fast_image_resize::{ResizeOptions, Resizer};
+    use fast_image_resize::{FilterType, ResizeAlg, ResizeOptions, Resizer};
     use image::RgbaImage;
     use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
 
@@ -109,6 +109,8 @@ mod native {
     const STATIC_FRAME_INTERVAL: Duration = Duration::from_secs(2);
     const AUTO_COOLDOWN: Duration = Duration::from_secs(1);
     const AUTO_UPGRADE_COOLDOWN: Duration = Duration::from_secs(3);
+    const NETWORK_DOWNGRADE_DELAY: Duration = Duration::from_secs(2);
+    const NETWORK_UPGRADE_DELAY: Duration = Duration::from_secs(12);
     const RESOLUTIONS: [u32; 3] = [480, 720, 1080];
     const FRAME_RATES: [u32; 4] = [15, 24, 30, 60];
     const SOURCE_GONE: &str =
@@ -127,6 +129,8 @@ mod native {
         encode_seconds: f64,
         samples: u8,
         last_change: Instant,
+        last_network_pressure: Option<Instant>,
+        bandwidth_limited_since: Option<Instant>,
     }
 
     impl Controls {
@@ -139,6 +143,8 @@ mod native {
                 encode_seconds: 0.0,
                 samples: 0,
                 last_change: Instant::now(),
+                last_network_pressure: None,
+                bandwidth_limited_since: None,
             }
         }
 
@@ -160,20 +166,48 @@ mod native {
             self.format = format;
             self.samples = 0;
             self.last_change = now;
+            self.bandwidth_limited_since = None;
         }
 
-        fn record_encode(&mut self, format: Format, elapsed: Duration, now: Instant) {
+        fn record_delivery(
+            &mut self,
+            format: Format,
+            elapsed: Option<Duration>,
+            now: Instant,
+            congested: bool,
+            bandwidth_limited: bool,
+        ) {
             if self.format != format {
                 return;
             }
-            let seconds = elapsed.as_secs_f64();
-            self.encode_seconds = if self.samples == 0 {
-                seconds
+            if let Some(elapsed) = elapsed {
+                let seconds = elapsed.as_secs_f64();
+                self.encode_seconds = if self.samples == 0 {
+                    seconds
+                } else {
+                    self.encode_seconds * 0.8 + seconds * 0.2
+                };
+                self.samples = self.samples.saturating_add(1);
+            }
+            if congested {
+                self.last_network_pressure = Some(now);
+            }
+            if bandwidth_limited {
+                self.bandwidth_limited_since.get_or_insert(now);
             } else {
-                self.encode_seconds * 0.8 + seconds * 0.2
-            };
-            self.samples = self.samples.saturating_add(1);
+                self.bandwidth_limited_since = None;
+            }
             let age = now.saturating_duration_since(self.last_change);
+            if self
+                .bandwidth_limited_since
+                .is_some_and(|at| now.saturating_duration_since(at) >= NETWORK_DOWNGRADE_DELAY)
+            {
+                let target = lower_network_format(self.settings, format);
+                if target != format {
+                    self.set_format(target, now);
+                    return;
+                }
+            }
             if self.samples < 8 || age < AUTO_COOLDOWN {
                 return;
             }
@@ -187,12 +221,32 @@ mod native {
                 self.settings,
                 format,
                 capacity,
-                age >= AUTO_UPGRADE_COOLDOWN,
+                age >= AUTO_UPGRADE_COOLDOWN
+                    && self.last_network_pressure.is_none_or(|at| {
+                        now.saturating_duration_since(at) >= NETWORK_UPGRADE_DELAY
+                    }),
             );
             if target != format {
                 self.set_format(target, now);
             }
         }
+    }
+
+    fn lower_network_format(settings: VideoSettings, format: Format) -> Format {
+        if settings.resolution == Resolution::Auto
+            && let Some(height) = RESOLUTIONS
+                .into_iter()
+                .rev()
+                .find(|height| *height < format.height)
+        {
+            return Format { height, ..format };
+        }
+        if settings.frame_rate == FrameRate::Auto
+            && let Some(fps) = FRAME_RATES.into_iter().rev().find(|fps| *fps < format.fps)
+        {
+            return Format { fps, ..format };
+        }
+        format
     }
 
     fn adaptive_format(
@@ -204,7 +258,7 @@ mod native {
         let auto_resolution = settings.resolution == Resolution::Auto;
         let auto_fps = settings.frame_rate == FrameRate::Auto;
         let target = f64::from(format.fps);
-        let minimum_smooth_fps = if auto_fps { target.min(24.0) } else { target };
+        let minimum_smooth_fps = if auto_fps { target.min(30.0) } else { target };
         let smaller = RESOLUTIONS
             .into_iter()
             .rev()
@@ -229,16 +283,10 @@ mod native {
                 .into_iter()
                 .find(|height| *height > format.height)
         {
-            // JPEG size and work broadly follow pixel count. Require headroom before trying a larger frame.
+            // Require enough encoding headroom to raise the resolution at the current frame rate.
             let projected = capacity * (f64::from(format.height) / f64::from(height)).powi(2);
-            let target_after_growth = if auto_fps { target.min(30.0) } else { target };
-            if projected >= target_after_growth * 1.2 {
-                let fps = if auto_fps {
-                    format.fps.min(sustainable_fps(projected / 1.2))
-                } else {
-                    format.fps
-                };
-                return Format { height, fps };
+            if projected >= target * 1.2 {
+                return Format { height, ..format };
             }
         }
         if auto_fps
@@ -430,6 +478,9 @@ mod native {
         let mut preview = None::<Arc<Frame>>;
         let mut last_jpeg = None::<Arc<[u8]>>;
         let mut resizer = Resizer::new();
+        let resize_options = ResizeOptions::new()
+            .resize_alg(ResizeAlg::Convolution(FilterType::CatmullRom))
+            .use_alpha(false);
         let mut encoder = crate::video::Encoder::default();
 
         while state.active() {
@@ -471,7 +522,7 @@ mod native {
                 } else {
                     let mut resized = RgbaImage::new(width, height);
                     resizer
-                        .resize(image, &mut resized, &ResizeOptions::new().use_alpha(false))
+                        .resize(image, &mut resized, &resize_options)
                         .map_err(|error| format!("Couldn't resize the screen frame: {error}"))?;
                     resized.into_raw()
                 };
@@ -514,13 +565,14 @@ mod native {
             publish(packet, legacy);
             let interval = Duration::from_secs_f64(1.0 / f64::from(format.fps));
             next_frame = (next_frame + interval).max(started + interval / 2);
-            if source_changed {
-                state.controls.lock().unwrap().record_encode(
-                    format,
-                    started.elapsed() + source.read_time,
-                    Instant::now(),
-                );
-            }
+            // Capture readback and encoding run on separate workers.
+            state.controls.lock().unwrap().record_delivery(
+                format,
+                source_changed.then(|| started.elapsed().max(source.read_time)),
+                Instant::now(),
+                feedback.congested,
+                encoder.bandwidth_limited(&feedback),
+            );
             source_changed = false;
         }
         Ok(())
@@ -647,6 +699,47 @@ mod native {
                 adaptive_format(settings, nominal, 40.0, true),
                 Format { fps: 30, ..nominal }
             );
+        }
+
+        #[test]
+        fn network_pressure_lowers_auto_resolution_before_frame_rate() {
+            let mut controls = Controls::new(VideoSettings::default());
+            let now = Instant::now();
+            let original = controls.format;
+            assert_eq!(
+                original,
+                Format {
+                    height: 720,
+                    fps: 30
+                }
+            );
+            controls.record_delivery(original, None, now, true, true);
+            assert_eq!(controls.format, original);
+            let down_at = now + NETWORK_DOWNGRADE_DELAY;
+            controls.record_delivery(original, None, down_at, true, true);
+            let reduced = Format {
+                height: 480,
+                fps: 30,
+            };
+            assert_eq!(controls.format, reduced);
+            for second in 1..=10 {
+                controls.record_delivery(
+                    reduced,
+                    Some(Duration::from_millis(2)),
+                    down_at + Duration::from_secs(second),
+                    false,
+                    false,
+                );
+            }
+            assert_eq!(controls.format, reduced);
+            controls.record_delivery(
+                reduced,
+                Some(Duration::from_millis(2)),
+                down_at + NETWORK_UPGRADE_DELAY,
+                false,
+                false,
+            );
+            assert_eq!(controls.format, original);
         }
 
         #[test]

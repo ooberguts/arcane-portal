@@ -4,6 +4,7 @@ use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket,
 };
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -26,14 +27,20 @@ const VERSION: &str = "1";
 const MAGIC: [u8; 8] = *b"APLAN01\n";
 const FAST_MAGIC: [u8; 8] = *b"APLAN02\n";
 const MOTION_MAGIC: [u8; 8] = *b"APLAN03\n";
+const PACED_MAGIC: [u8; 8] = *b"APLAN04\n";
 const AUDIO_MAGIC: [u8; 8] = *b"APAUD01\n";
 const FRAME_REQUEST: [u8; 1] = [1];
 const VIDEO_CREDITS: usize = 2;
-const MOTION_CREDITS: usize = 3;
-const MAX_MOTION_FRAMES: usize = 18;
-const MOTION_DEADLINE: Duration = Duration::from_millis(250);
+const MOTION_CREDITS: usize = 16;
+const MAX_MOTION_FRAMES: usize = 48;
+const MOTION_PRESSURE: Duration = Duration::from_millis(180);
+const MOTION_DEADLINE: Duration = Duration::from_millis(750);
+const DELIVERY_PRESSURE: Duration = video::PLAYOUT_DELAY;
 const AUDIO_BUFFER: usize = 6;
 const AUDIO_FRESHNESS: Duration = Duration::from_millis(200);
+// The output device already primes two 20 ms audio packets.
+const VIEWER_AUDIO_DELAY: Duration = video::PLAYOUT_DELAY.saturating_sub(Duration::from_millis(40));
+const VIEWER_AUDIO_BUFFER: usize = 20;
 const FPS_WINDOW: Duration = Duration::from_secs(1);
 const MAX_TEXT_BYTES: usize = 120;
 const MAX_METADATA_BYTES: usize = 2_048;
@@ -54,6 +61,7 @@ pub struct Room {
     service_id: Option<String>,
     fast_video: bool,
     motion_video: bool,
+    paced_video: bool,
     pub name: String,
     pub title: String,
     pub height: u32,
@@ -100,6 +108,7 @@ impl RoomDetails {
             service_id: None,
             fast_video: false,
             motion_video: false,
+            paced_video: false,
             name: self.name,
             title: self.title,
             height: self.height,
@@ -226,6 +235,7 @@ fn discovered_room(service: &ResolvedService, interfaces: &[Interface]) -> Optio
     room.service_id = Some(service.get_fullname().to_owned());
     room.fast_video = service.get_property_val_str("video") == Some("2");
     room.motion_video = service.get_property_val_str("codec") == Some("h264");
+    room.paced_video = room.motion_video && service.get_property_val_str("pacing") == Some("1");
     Some(room)
 }
 
@@ -754,6 +764,7 @@ impl Advertisement {
             ("viewers", viewers.to_string()),
             ("video", "2".to_owned()),
             ("codec", if motion { "h264" } else { "jpeg" }.to_owned()),
+            ("pacing", if motion { "1" } else { "0" }.to_owned()),
         ];
         let mut service = ServiceInfo::new(
             SERVICE_TYPE,
@@ -887,7 +898,7 @@ fn stream_frames(
     let credits = match magic {
         MAGIC => 1,
         FAST_MAGIC => VIDEO_CREDITS,
-        MOTION_MAGIC => MOTION_CREDITS,
+        MOTION_MAGIC | PACED_MAGIC => MOTION_CREDITS,
         AUDIO_MAGIC => {
             client.reserve_channel(Channel::Audio)?;
             write_handshake(&mut socket, &magic, details)?;
@@ -899,7 +910,7 @@ fn stream_frames(
             ));
         }
     };
-    let motion = magic == MOTION_MAGIC;
+    let motion = magic == MOTION_MAGIC || magic == PACED_MAGIC;
     client.reserve_channel(if motion {
         Channel::Video
     } else {
@@ -909,14 +920,25 @@ fn stream_frames(
     socket.set_read_timeout(Some(IO_TIMEOUT))?;
     socket.set_write_timeout(Some(IO_TIMEOUT))?;
 
+    let window = if magic == PACED_MAGIC {
+        Some(DeliveryWindow::start(&socket, &client.host)?)
+    } else {
+        None
+    };
     let mut request = [0];
     let mut previous = 0;
     let mut sent_at = VecDeque::with_capacity(credits);
     loop {
-        // Request one frame only after decoding the last. Slow viewers skip stale frames.
-        socket.read_exact(&mut request)?;
-        if request != FRAME_REQUEST {
-            return Err(invalid_data("Unexpected frame request"));
+        if let Some(window) = &window {
+            window
+                .ready
+                .recv_timeout(IO_TIMEOUT)
+                .map_err(io::Error::other)?;
+        } else {
+            socket.read_exact(&mut request)?;
+            if request != FRAME_REQUEST {
+                return Err(invalid_data("Unexpected frame request"));
+            }
         }
         if !motion
             && sent_at.len() == credits
@@ -958,9 +980,62 @@ fn stream_frames(
         if !motion {
             sent_at.push_back(Instant::now());
         }
+        if let Some(window) = &window {
+            window.sent.send(Instant::now()).map_err(io::Error::other)?;
+        }
         socket.write_all(&header[..header_len])?;
         socket.write_all(&bytes)?;
         previous = sequence;
+    }
+}
+
+struct DeliveryWindow {
+    socket: TcpStream,
+    ready: Receiver<()>,
+    sent: SyncSender<Instant>,
+}
+
+impl DeliveryWindow {
+    fn start(socket: &TcpStream, host: &Arc<HostState>) -> io::Result<Self> {
+        let (grant, ready) = mpsc::sync_channel(MOTION_CREDITS);
+        for _ in 0..MOTION_CREDITS {
+            grant.try_send(()).map_err(io::Error::other)?;
+        }
+        let (sent, deliveries) = mpsc::sync_channel::<Instant>(MOTION_CREDITS);
+        let mut reader = socket.try_clone()?;
+        let socket = socket.try_clone()?;
+        let host = Arc::clone(host);
+        thread::Builder::new()
+            .name("arcane-delivery".into())
+            .spawn(move || {
+                let mut ack = [0];
+                let mut average = Duration::ZERO;
+                while reader.read_exact(&mut ack).is_ok() && ack == FRAME_REQUEST {
+                    let Ok(sent_at) = deliveries.recv_timeout(IO_TIMEOUT) else {
+                        break;
+                    };
+                    let sample = sent_at.elapsed();
+                    average = (average * 3 + sample) / 4;
+                    if average >= DELIVERY_PRESSURE || sample >= MOTION_PRESSURE * 2 {
+                        host.data.lock().unwrap().last_congestion = Some(Instant::now());
+                    }
+                    if grant.try_send(()).is_err() {
+                        break;
+                    }
+                }
+                let _ = reader.shutdown(Shutdown::Both);
+            })?;
+        Ok(Self {
+            socket,
+            ready,
+            sent,
+        })
+    }
+}
+
+impl Drop for DeliveryWindow {
+    fn drop(&mut self) {
+        let _ = self.socket.shutdown(Shutdown::Both);
     }
 }
 
@@ -977,8 +1052,13 @@ fn wait_for_motion(host: &HostState, previous: u64) -> io::Result<(u64, Packet, 
         }
         if !resuming && let Some(next) = data.motion.iter().find(|frame| frame.sequence > previous)
         {
-            if next.sequence == previous + 1 && next.published.elapsed() <= MOTION_DEADLINE {
-                return Ok((next.sequence, next.packet.clone(), data.viewers, false));
+            let age = next.published.elapsed();
+            if next.sequence == previous + 1 && age <= MOTION_DEADLINE {
+                let packet = (next.sequence, next.packet.clone(), data.viewers, false);
+                if age > MOTION_PRESSURE {
+                    data.last_congestion = Some(Instant::now());
+                }
+                return Ok(packet);
             }
             resuming = true;
             data.last_congestion = Some(Instant::now());
@@ -987,7 +1067,7 @@ fn wait_for_motion(host: &HostState, previous: u64) -> io::Result<(u64, Packet, 
             if let Some(keyframe) = data.motion.iter().rev().find(|frame| {
                 frame.sequence > previous
                     && frame.packet.keyframe
-                    && frame.published.elapsed() <= MOTION_DEADLINE
+                    && frame.published.elapsed() <= video::PLAYOUT_DELAY
             }) {
                 return Ok((
                     keyframe.sequence,
@@ -1098,12 +1178,14 @@ struct ViewerState {
     socket: Option<TcpStream>,
     audio_socket: Option<TcpStream>,
     frame: Option<Arc<Frame>>,
+    pending_legacy_frame: Option<Arc<Frame>>,
     playout: Playout,
     decoded_video: bool,
     room: Option<Room>,
     error: Option<String>,
     fps: FrameRate,
-    audio: VecDeque<Arc<[u8]>>,
+    audio: VecDeque<(Instant, Arc<[u8]>)>,
+    audio_delay: Duration,
     audio_error: Option<String>,
 }
 
@@ -1115,6 +1197,7 @@ struct JoinPlan {
     service_id: Option<String>,
     fast_video: bool,
     motion_video: bool,
+    paced_video: bool,
 }
 
 impl JoinPlan {
@@ -1139,12 +1222,13 @@ impl Viewer {
             room.service_id.clone(),
             room.fast_video,
             room.motion_video,
+            room.paced_video,
         )
     }
 
     #[cfg(test)]
     fn connect(address: SocketAddrV4) -> Result<Self, String> {
-        Self::start(vec![address], None, None, false, false)
+        Self::start(vec![address], None, None, false, false, false)
     }
 
     fn start(
@@ -1153,6 +1237,7 @@ impl Viewer {
         service_id: Option<String>,
         fast_video: bool,
         motion_video: bool,
+        paced_video: bool,
     ) -> Result<Self, String> {
         let interfaces = lan_interfaces();
         candidates.retain(|address| {
@@ -1174,6 +1259,7 @@ impl Viewer {
             service_id,
             fast_video,
             motion_video,
+            paced_video,
         };
         thread::Builder::new()
             .name("arcane-viewer".into())
@@ -1184,10 +1270,24 @@ impl Viewer {
 
     pub fn frame(&self) -> Option<Arc<Frame>> {
         let mut state = self.state.lock().unwrap();
-        if let Some(frame) = state.playout.due(Instant::now()) {
+        if let Some(frame) = state
+            .playout
+            .due(Instant::now())
+            .or_else(|| state.pending_legacy_frame.take())
+        {
             state.frame = Some(frame);
+            state.fps.record();
         }
         state.frame.clone()
+    }
+
+    pub fn next_frame_delay(&self) -> Option<Duration> {
+        self.state
+            .lock()
+            .unwrap()
+            .playout
+            .next_due()
+            .map(|due| due.saturating_duration_since(Instant::now()))
     }
 
     pub fn room(&self) -> Option<Room> {
@@ -1203,7 +1303,18 @@ impl Viewer {
     }
 
     pub fn take_audio_packets(&self) -> Vec<Arc<[u8]>> {
-        self.state.lock().unwrap().audio.drain(..).collect()
+        let now = Instant::now();
+        let mut state = self.state.lock().unwrap();
+        let count = state
+            .audio
+            .iter()
+            .take_while(|(due, _)| *due <= now)
+            .count();
+        state
+            .audio
+            .drain(..count)
+            .map(|(_, packet)| packet)
+            .collect()
     }
 
     pub fn audio_error(&self) -> Option<String> {
@@ -1307,7 +1418,9 @@ fn receive_frames(
         }
         state.socket = Some(socket.try_clone()?);
     }
-    let (magic, credits) = if plan.motion_video {
+    let (magic, credits) = if plan.paced_video {
+        (PACED_MAGIC, 0)
+    } else if plan.motion_video {
         (MOTION_MAGIC, MOTION_CREDITS)
     } else if plan.fast_video {
         (FAST_MAGIC, VIDEO_CREDITS)
@@ -1315,7 +1428,13 @@ fn receive_frames(
         (MAGIC, 1)
     };
     let details = negotiate(&mut socket, &magic, plan.identity.as_ref())?;
-    viewer.lock().unwrap().room = Some(details.into_room(address, 0));
+    {
+        let mut state = viewer.lock().unwrap();
+        state.room = Some(details.into_room(address, 0));
+        if plan.motion_video {
+            state.audio_delay = VIEWER_AUDIO_DELAY;
+        }
+    }
     socket.set_read_timeout(Some(IO_TIMEOUT))?;
     socket.write_all(&[FRAME_REQUEST[0]; MOTION_CREDITS][..credits])?;
 
@@ -1332,6 +1451,9 @@ fn receive_frames(
         }
         packet.resize(length, 0);
         socket.read_exact(&mut packet)?;
+        if plan.motion_video {
+            socket.write_all(&FRAME_REQUEST)?;
+        }
         let reset = plan.motion_video && header[13] != 0;
         let frame = if plan.motion_video {
             if reset || decoder.is_none() {
@@ -1342,7 +1464,6 @@ fn receive_frames(
             Some(decode_frame(&packet)?)
         };
         let Some(frame) = frame else {
-            socket.write_all(&FRAME_REQUEST)?;
             continue;
         };
         let height = frame.height;
@@ -1361,9 +1482,8 @@ fn receive_frames(
                     .playout
                     .push(timestamp, Instant::now(), Arc::new(frame));
             } else {
-                state.frame = Some(Arc::new(frame));
+                state.pending_legacy_frame = Some(Arc::new(frame));
             }
-            state.fps.record();
             if let Some(room) = &mut state.room {
                 room.height = height;
                 room.viewers = usize::from(header[4]).min(MAX_VIEWERS);
@@ -1373,7 +1493,9 @@ fn receive_frames(
             start_audio_receiver(viewer, plan, address, used_reverse);
             first_frame = false;
         }
-        socket.write_all(&FRAME_REQUEST)?;
+        if !plan.motion_video {
+            socket.write_all(&FRAME_REQUEST)?;
+        }
     }
 }
 
@@ -1481,10 +1603,11 @@ fn receive_audio(mut socket: TcpStream, viewer: &Mutex<ViewerState>) -> io::Resu
         if state.stopped || state.error.is_some() {
             return Ok(());
         }
-        if state.audio.len() == AUDIO_BUFFER {
+        if state.audio.len() == VIEWER_AUDIO_BUFFER {
             state.audio.pop_front();
         }
-        state.audio.push_back(Arc::from(samples));
+        let due = Instant::now() + state.audio_delay;
+        state.audio.push_back((due, Arc::from(samples)));
     }
 }
 
@@ -1641,6 +1764,7 @@ mod tests {
         let mut room = details.into_room(host.addresses()[0], 0);
         room.motion_video = true;
         room.fast_video = true;
+        room.paced_video = true;
         let viewer = Viewer::join(&room).unwrap();
         eventually(|| viewer.frame().is_some_and(|frame| frame.height == 72));
         codec.update_picture(96, 64, &vec![184; 96 * 64 * 4]);
@@ -1658,6 +1782,30 @@ mod tests {
         eventually(|| legacy.frame().is_some());
         assert_eq!(host.viewers(), 2);
         assert!(viewer.error().is_none());
+    }
+
+    #[test]
+    fn slow_viewer_acknowledgment_sets_bitrate_feedback() {
+        let details = RoomDetails::new("Host", "Motion", 720, 30).unwrap();
+        let host = Host::listen(details.clone(), 0, Vec::new()).unwrap();
+        let publish = host.video_publisher();
+        publish.publish(
+            Some(Packet {
+                bytes: Arc::from([7u8]),
+                timestamp_ms: 0,
+                keyframe: true,
+            }),
+            None,
+        );
+        let mut socket = TcpStream::connect(host.addresses()[0]).unwrap();
+        negotiate(&mut socket, &PACED_MAGIC, None).unwrap();
+        let mut frame = [0; 15];
+        socket.read_exact(&mut frame).unwrap();
+        assert_eq!(frame[14], 7);
+        assert!(!publish.feedback().congested);
+        thread::sleep(MOTION_PRESSURE * 2);
+        socket.write_all(&FRAME_REQUEST).unwrap();
+        eventually(|| publish.feedback().congested);
     }
 
     #[test]
